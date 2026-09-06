@@ -2626,7 +2626,7 @@ under your account.
 
 <h3>5. Payments &amp; Betslips</h3>
 <ul>
-<li>Prices are shown in Tanzanian Shillings (TSh) and paid via PalmPesa mobile money.</li>
+<li>Prices are shown in Tanzanian Shillings (TSh) and paid via a third-party mobile money payment provider.</li>
 <li>Once payment is confirmed, the betslip unlocks instantly on your account.</li>
 <li>Some betslips carry a validity period shown on the card. After it expires the betslip is removed automatically and is no longer accessible, even if previously purchased.</li>
 </ul>
@@ -2707,7 +2707,7 @@ your information when you use the platform.
 <h3>2. Information We Collect</h3>
 <ul>
 <li>Account details you provide: name, email address and password.</li>
-<li>Payment details processed by PalmPesa when you pay for a betslip (we do not see or store your mobile money PIN).</li>
+<li>Payment details processed by a third-party payment provider when you pay for a betslip (we do not see or store your mobile money PIN).</li>
 <li>Basic usage information, such as which betslips you've unlocked.</li>
 </ul>
 
@@ -2722,7 +2722,7 @@ your information when you use the platform.
 <h3>4. Third-Party Services</h3>
 <p>
 We use Firebase (Google) for account authentication and data storage,
-and PalmPesa for mobile money payment processing. These providers handle
+and a third-party payment provider for mobile money payment processing. These providers handle
 your data under their own security and privacy practices.
 </p>
 
@@ -5086,7 +5086,7 @@ result
 );
 
 throw new Error(
-'PalmPesa did not return an order ID.'
+'The payment provider did not return an order ID.'
 );
 
 }
@@ -5170,7 +5170,7 @@ const result=
 await response.json();
 
 console.log(
-'PalmPesa status:',
+'Payment status:',
 result
 );
 
