@@ -12,13 +12,6 @@ export default async function handler(req, res) {
 
   try {
 
-    /* ===== TEMPORARY: payments disabled — remove this block to re-enable ===== */
-    return res.status(503).json({
-      success: false,
-      message: "Payments are temporarily unavailable. Please try again later."
-    });
-    /* =========================================================================== */
-
     /*
      * FRONTEND DATA
      */
@@ -40,18 +33,55 @@ export default async function handler(req, res) {
       !email ||
       !phone ||
       !amount
-  
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "All fields are required"
+      });
+    }
+
+
+    /*
+     * NORMALIZE TANZANIAN PHONE NUMBER
+     *
+     * Accepted:
+     *
+     * 0712345678
+     * 0612345678
+     * +255712345678
+     * 255712345678
      */
     function normalizeTanzaniaPhone(value) {
 
       let p = String(value)
         .trim()
-      
+        .replace(/\s+/g, "")
+        .replace(/-/g, "");
+
+      if (p.startsWith("+255")) {
+        p = p.substring(1);
+      }
+
+      if (p.startsWith("0")) {
+        p = "255" + p.substring(1);
+      }
 
       return p;
-    
+    }
+
+
+    const normalizedPhone =
+      normalizeTanzaniaPhone(phone);
+
+
+    /*
+     * VALIDATE TANZANIA NUMBER
      *
-     * Tanzania mobi
+     * Tanzania mobile numbers normally become:
+     *
+     * 255XXXXXXXXX
+     */
+    if (
       !/^255\d{9}$/.test(normalizedPhone)
     ) {
 
@@ -116,7 +146,17 @@ export default async function handler(req, res) {
       "761",
       "762",
       "763",
-      "
+      "764",
+      "765",
+      "766",
+      "767",
+      "768",
+      "769",
+      "770",
+      "771",
+      "772",
+      "773",
+      "774",
       "775",
       "776",
       "777",
@@ -145,6 +185,17 @@ export default async function handler(req, res) {
       "693",
       "694",
       "695",
+      "696",
+      "697",
+      "698",
+      "699"
+    ];
+
+
+    /*
+     * HALOTEL
+     */
+    const halotelPrefixes = [
       "620",
       "621",
       "622",
@@ -201,7 +252,15 @@ export default async function handler(req, res) {
     /*
      * TTCL
      */
-    
+    const ttclPrefixes = [
+      "710",
+      "711",
+      "712",
+      "713",
+      "714",
+      "715",
+      "716",
+      "717",
       "718",
       "719"
     ];
@@ -291,7 +350,17 @@ export default async function handler(req, res) {
       name
     );
 
-    
+    console.log(
+      "Original phone:",
+      phone
+    );
+
+    console.log(
+      "Normalized phone:",
+      normalizedPhone
+    );
+
+    console.log(
       "Prefix:",
       prefix
     );
@@ -316,9 +385,30 @@ export default async function handler(req, res) {
       userId || "not provided"
     );
 
-    
+    console.log(
+      "Transaction ID:",
+      transactionId
+    );
+
+    console.log(
+      "=================================================="
+    );
+
+
+    /*
+     * SEND TO PALMPESA
      */
-   
+    const response =
+      await fetch(
+        "https://palmpesa.drmlelwa.co.tz/api/pay-via-mobile",
+        {
+          method: "POST",
+
+          headers: {
+
+            "Authorization":
+              `Bearer ${process.env.PALMPESA_TOKEN}`,
+
             "Content-Type":
               "application/json",
 
