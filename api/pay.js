@@ -54,12 +54,56 @@ export default async function handler(req, res) {
     function normalizeTanzaniaPhone(value) {
 
       let p = String(value)
-     
-     
-    
-     
+        .trim()
+        .replace(/\s+/g, "")
+        .replace(/-/g, "");
 
-    /*one.substring(3, 6);
+      if (p.startsWith("+255")) {
+        p = p.substring(1);
+      }
+
+      if (p.startsWith("0")) {
+        p = "255" + p.substring(1);
+      }
+
+      return p;
+    }
+
+
+    const normalizedPhone =
+      normalizeTanzaniaPhone(phone);
+
+
+    /*
+     * VALIDATE TANZANIA NUMBER
+     *
+     * Tanzania mobile numbers normally become:
+     *
+     * 255XXXXXXXXX
+     */
+    if (
+      !/^255\d{9}$/.test(normalizedPhone)
+    ) {
+
+      return res.status(400).json({
+        success: false,
+        message:
+          "Invalid Tanzania phone number. Use 07XXXXXXXX, 06XXXXXXXX or +255XXXXXXXXX."
+      });
+
+    }
+
+
+    /*
+     * GET THE PREFIX
+     *
+     * Example:
+     *
+     * 255712345678
+     *      ^^^
+     */
+    const prefix =
+      normalizedPhone.substring(3, 6);
 
 
     /*
@@ -276,7 +320,22 @@ export default async function handler(req, res) {
 
       email: email,
 
-      
+      phone: normalizedPhone,
+
+      amount: Number(amount),
+
+      transaction_id: transactionId,
+
+      address: "Geita",
+
+      postcode: "30100",
+
+      /*
+       * EXTRA NETWORK INFORMATION
+       */
+      network: network
+
+    };
 
 
     /*
@@ -299,7 +358,20 @@ export default async function handler(req, res) {
     console.log(
       "Normalized phone:",
       normalizedPhone
-    )
+    );
+
+    console.log(
+      "Prefix:",
+      prefix
+    );
+
+    console.log(
+      "Detected network:",
+      network
+    );
+
+    console.log(
+      "Amount:",
       Number(amount)
     );
 
@@ -326,7 +398,34 @@ export default async function handler(req, res) {
     /*
      * SEND TO PALMPESA
      */
-   
+    const response =
+      await fetch(
+        "https://palmpesa.drmlelwa.co.tz/api/pay-via-mobile",
+        {
+          method: "POST",
+
+          headers: {
+
+            "Authorization":
+              `Bearer ${process.env.PALMPESA_TOKEN}`,
+
+            "Content-Type":
+              "application/json",
+
+            "Accept":
+              "application/json"
+
+          },
+
+          body:
+            JSON.stringify(
+              paymentData
+            )
+
+        }
+      );
+
+
     /*
      * READ RAW RESPONSE
      */
@@ -374,12 +473,34 @@ export default async function handler(req, res) {
      * Different API response structures
      * are handled.
      */
-    
+    const orderId =
+      data?.order_id ||
+      data?.data?.order_id ||
+      data?.data?.data?.order_id ||
+      data?.order?.order_id ||
+      null;
+
+
+    /*
+     * FINAL DEBUG
+     */
+    console.log(
+      "Detected PalmPesa order ID:",
+      orderId
     );
 
 
     /*
-     
+     * RETURN TO FRONTEND
+     */
+    return res.status(
+      response.status
+    ).json({
+
+      success:
+        response.ok,
+
+      palmPesaStatus:
         response.status,
 
       transaction_id:
@@ -411,6 +532,18 @@ export default async function handler(req, res) {
     );
 
 
-   
+    return res.status(500).json({
+
+      success: false,
+
+      message:
+        "Server error while contacting PalmPesa",
+
+      error:
+        error.message
+
+    });
+
+  }
 
 }
