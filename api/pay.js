@@ -1,3 +1,139 @@
+/*
+ * ===========================================================
+ * STATIC DATA — hoisted to module scope.
+ *
+ * These used to be declared *inside* the handler, which meant
+ * every single payment request re-allocated five arrays and a
+ * closure from scratch before doing any real work. Defining
+ * them once at module load time (cold start) instead of once
+ * per request is free performance.
+ * ===========================================================
+ */
+
+const MPESA_PREFIXES = new Set([
+  "740", "741", "742", "743", "744", "745", "746", "747", "748", "749",
+  "750", "751", "752", "753", "754", "755", "756", "757", "758", "759",
+  "760", "761", "762", "763", "764", "765", "766", "767", "768", "769",
+  "770", "771", "772", "773", "774", "775", "776", "777", "778", "779"
+]);
+
+const AIRTEL_PREFIXES = new Set([
+  "680", "681", "682", "683", "684", "685", "686", "687", "688", "689",
+  "690", "691", "692", "693", "694", "695", "696", "697", "698", "699"
+]);
+
+const HALOTEL_PREFIXES = new Set([
+  "620", "621", "622", "623", "624", "625", "626", "627", "628", "629"
+]);
+
+const MIXX_PREFIXES = new Set([
+  "650", "651", "652", "653", "654", "655", "656", "657", "658", "659",
+  "660", "661", "662", "663", "664", "665", "666", "667", "668", "669",
+  "670", "671", "672", "673", "674", "675", "676", "677", "678", "679"
+]);
+
+const TTCL_PREFIXES = new Set([
+  "710", "711", "712", "713", "714", "715", "716", "717", "718", "719"
+]);
+
+/*
+ * How long we'll wait on PalmPesa before giving up and returning
+ * a clean error to the frontend, instead of hanging until the
+ * hosting platform's own (often much longer, and much less
+ * informative) function timeout kicks in.
+ */
+const PALMPESA_TIMEOUT_MS = 15000;
+
+/*
+ * NORMALIZE TANZANIAN PHONE NUMBER
+ *
+ * Accepted:
+ *
+ * 0712345678
+ * 0612345678
+ * +255712345678
+ * 255712345678
+ */
+function normalizeTanzaniaPhone(value) {
+
+  let p = String(value)
+    .trim()
+    .replace(/\s+/g, "")
+    .replace(/-/g, "");
+
+  if (p.startsWith("+255")) {
+    p = p.substring(1);
+  }
+
+  if (p.startsWith("0")) {
+    p = "255" + p.substring(1);
+  }
+
+  return p;
+}
+
+/*
+ * DETECT NETWORK FROM PREFIX
+ *
+ * Mainly for logging/debugging — not relied on for PalmPesa
+ * routing unless their API explicitly supports it.
+ */
+function detectNetwork(prefix) {
+
+  if (MPESA_PREFIXES.has(prefix)) {
+    return "MPESA";
+  }
+
+  if (AIRTEL_PREFIXES.has(prefix)) {
+    return "AIRTEL";
+  }
+
+  if (HALOTEL_PREFIXES.has(prefix)) {
+    return "HALOPESA";
+  }
+
+  if (MIXX_PREFIXES.has(prefix)) {
+    return "MIXX";
+  }
+
+  if (TTCL_PREFIXES.has(prefix)) {
+    return "TTCL";
+  }
+
+  return "UNKNOWN";
+}
+
+/*
+ * FETCH WITH TIMEOUT
+ *
+ * Wraps fetch with an AbortController so a slow or hung
+ * PalmPesa endpoint fails fast with a clear error instead of
+ * holding the request open until the platform kills it.
+ */
+async function fetchWithTimeout(url, options, timeoutMs) {
+
+  const controller = new AbortController();
+
+  const timer = setTimeout(
+    () => controller.abort(),
+    timeoutMs
+  );
+
+  try {
+
+    return await fetch(url, {
+      ...options,
+      signal: controller.signal
+    });
+
+  } finally {
+
+    clearTimeout(timer);
+
+  }
+
+}
+
 export default async function handler(req, res) {
 
   /*
@@ -41,35 +177,6 @@ export default async function handler(req, res) {
     }
 
 
-    /*
-     * NORMALIZE TANZANIAN PHONE NUMBER
-     *
-     * Accepted:
-     *
-     * 0712345678
-     * 0612345678
-     * +255712345678
-     * 255712345678
-     */
-    function normalizeTanzaniaPhone(value) {
-
-      let p = String(value)
-        .trim()
-        .replace(/\s+/g, "")
-        .replace(/-/g, "");
-
-      if (p.startsWith("+255")) {
-        p = p.substring(1);
-      }
-
-      if (p.startsWith("0")) {
-        p = "255" + p.substring(1);
-      }
-
-      return p;
-    }
-
-
     const normalizedPhone =
       normalizeTanzaniaPhone(phone);
 
@@ -105,191 +212,8 @@ export default async function handler(req, res) {
     const prefix =
       normalizedPhone.substring(3, 6);
 
-
-    /*
-     * TANZANIA NETWORK DETECTION
-     *
-     * IMPORTANT:
-     *
-     * This is mainly for logging/debugging.
-     * We DO NOT rely on this field for PalmPesa
-     * routing unless their API explicitly supports it.
-     */
-    let network = "UNKNOWN";
-
-
-    /*
-     * VODACOM / M-PESA
-     */
-    const mpesaPrefixes = [
-      "740",
-      "741",
-      "742",
-      "743",
-      "744",
-      "745",
-      "746",
-      "747",
-      "748",
-      "749",
-      "750",
-      "751",
-      "752",
-      "753",
-      "754",
-      "755",
-      "756",
-      "757",
-      "758",
-      "759",
-      "760",
-      "761",
-      "762",
-      "763",
-      "764",
-      "765",
-      "766",
-      "767",
-      "768",
-      "769",
-      "770",
-      "771",
-      "772",
-      "773",
-      "774",
-      "775",
-      "776",
-      "777",
-      "778",
-      "779"
-    ];
-
-
-    /*
-     * AIRTEL
-     */
-    const airtelPrefixes = [
-      "680",
-      "681",
-      "682",
-      "683",
-      "684",
-      "685",
-      "686",
-      "687",
-      "688",
-      "689",
-      "690",
-      "691",
-      "692",
-      "693",
-      "694",
-      "695",
-      "696",
-      "697",
-      "698",
-      "699"
-    ];
-
-
-    /*
-     * HALOTEL
-     */
-    const halotelPrefixes = [
-      "620",
-      "621",
-      "622",
-      "623",
-      "624",
-      "625",
-      "626",
-      "627",
-      "628",
-      "629"
-    ];
-
-
-    /*
-     * TIGO / MIXX BY YAS
-     *
-     * Number ranges can change, therefore
-     * this is only a best-effort detection.
-     */
-    const mixxPrefixes = [
-      "650",
-      "651",
-      "652",
-      "653",
-      "654",
-      "655",
-      "656",
-      "657",
-      "658",
-      "659",
-      "660",
-      "661",
-      "662",
-      "663",
-      "664",
-      "665",
-      "666",
-      "667",
-      "668",
-      "669",
-      "670",
-      "671",
-      "672",
-      "673",
-      "674",
-      "675",
-      "676",
-      "677",
-      "678",
-      "679"
-    ];
-
-
-    /*
-     * TTCL
-     */
-    const ttclPrefixes = [
-      "710",
-      "711",
-      "712",
-      "713",
-      "714",
-      "715",
-      "716",
-      "717",
-      "718",
-      "719"
-    ];
-
-
-    /*
-     * DETECT
-     */
-    if (mpesaPrefixes.includes(prefix)) {
-
-      network = "MPESA";
-
-    } else if (airtelPrefixes.includes(prefix)) {
-
-      network = "AIRTEL";
-
-    } else if (halotelPrefixes.includes(prefix)) {
-
-      network = "HALOPESA";
-
-    } else if (mixxPrefixes.includes(prefix)) {
-
-      network = "MIXX";
-
-    } else if (ttclPrefixes.includes(prefix)) {
-
-      network = "TTCL";
-
-    }
+    const network =
+      detectNetwork(prefix);
 
 
     /*
@@ -330,9 +254,6 @@ export default async function handler(req, res) {
 
       postcode: "30100",
 
-      /*
-       * EXTRA NETWORK INFORMATION
-       */
       network: network
 
     };
@@ -340,90 +261,85 @@ export default async function handler(req, res) {
 
     /*
      * SERVER DEBUG LOG
+     *
+     * Collapsed into a single structured log line instead of a
+     * dozen separate console.log calls — each one is a
+     * synchronous write, and on most serverless platforms that
+     * adds up to real latency on every request.
      */
-    console.log(
-      "================ PALMPESA PAYMENT ================"
-    );
-
-    console.log(
-      "Customer:",
-      name
-    );
-
-    console.log(
-      "Original phone:",
-      phone
-    );
-
-    console.log(
-      "Normalized phone:",
-      normalizedPhone
-    );
-
-    console.log(
-      "Prefix:",
-      prefix
-    );
-
-    console.log(
-      "Detected network:",
-      network
-    );
-
-    console.log(
-      "Amount:",
-      Number(amount)
-    );
-
-    console.log(
-      "Post ID:",
-      postId || "not provided"
-    );
-
-    console.log(
-      "User ID:",
-      userId || "not provided"
-    );
-
-    console.log(
-      "Transaction ID:",
+    console.log("PalmPesa payment request:", {
+      name,
+      phone,
+      normalizedPhone,
+      prefix,
+      network,
+      amount: Number(amount),
+      postId: postId || "not provided",
+      userId: userId || "not provided",
       transactionId
-    );
-
-    console.log(
-      "=================================================="
-    );
+    });
 
 
     /*
-     * SEND TO PALMPESA
+     * SEND TO PALMPESA — bounded by PALMPESA_TIMEOUT_MS so a
+     * hung provider doesn't hang this whole request.
      */
-    const response =
-      await fetch(
-        "https://palmpesa.drmlelwa.co.tz/api/pay-via-mobile",
-        {
-          method: "POST",
+    let response;
 
-          headers: {
+    try {
 
-            "Authorization":
-              `Bearer ${process.env.PALMPESA_TOKEN}`,
+      response =
+        await fetchWithTimeout(
+          "https://palmpesa.drmlelwa.co.tz/api/pay-via-mobile",
+          {
+            method: "POST",
 
-            "Content-Type":
-              "application/json",
+            headers: {
 
-            "Accept":
-              "application/json"
+              "Authorization":
+                `Bearer ${process.env.PALMPESA_TOKEN}`,
+
+              "Content-Type":
+                "application/json",
+
+              "Accept":
+                "application/json"
+
+            },
+
+            body:
+              JSON.stringify(
+                paymentData
+              )
 
           },
+          PALMPESA_TIMEOUT_MS
+        );
 
-          body:
-            JSON.stringify(
-              paymentData
-            )
+    } catch (fetchError) {
 
-        }
+      const timedOut =
+        fetchError.name === "AbortError";
+
+      console.error(
+        "PalmPesa request failed:",
+        timedOut ? "timed out" : fetchError.message
       );
+
+      return res.status(504).json({
+
+        success: false,
+
+        message:
+          timedOut
+            ? "PalmPesa did not respond in time. Please try again."
+            : "Unable to reach PalmPesa. Please try again.",
+
+        transaction_id: transactionId
+
+      });
+
+    }
 
 
     /*
@@ -431,18 +347,6 @@ export default async function handler(req, res) {
      */
     const rawResponse =
       await response.text();
-
-
-    console.log(
-      "PalmPesa HTTP status:",
-      response.status
-    );
-
-
-    console.log(
-      "PalmPesa raw response:",
-      rawResponse
-    );
 
 
     /*
@@ -481,13 +385,10 @@ export default async function handler(req, res) {
       null;
 
 
-    /*
-     * FINAL DEBUG
-     */
-    console.log(
-      "Detected PalmPesa order ID:",
+    console.log("PalmPesa response:", {
+      httpStatus: response.status,
       orderId
-    );
+    });
 
 
     /*
