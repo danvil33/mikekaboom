@@ -15,12 +15,42 @@
 <meta name="apple-mobile-web-app-title" content="MIKEKA BOOM">
 <meta name="format-detection" content="telephone=no">
 
+<!-- Connection warm-up: opens the sockets to every third-party host this page needs
+     before the browser would otherwise discover them, so those requests don't each
+     pay a fresh DNS + TLS handshake later in the load. -->
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Inter:wght@400;500;600;700;800&family=IBM+Plex+Mono:wght@500;600;700&display=swap" rel="stylesheet">
+<link rel="preconnect" href="https://cdnjs.cloudflare.com" crossorigin>
+<link rel="preconnect" href="https://www.gstatic.com" crossorigin>
+<link rel="preconnect" href="https://raw.githubusercontent.com" crossorigin>
+<link rel="dns-prefetch" href="https://firestore.googleapis.com">
+<link rel="dns-prefetch" href="https://identitytoolkit.googleapis.com">
+<link rel="dns-prefetch" href="https://firebaseinstallations.googleapis.com">
+
+<!-- Start fetching the Firebase SDK modules immediately instead of waiting for the
+     parser to reach the <script type="module"> tag at the bottom of the page. -->
+<link rel="modulepreload" href="https://www.gstatic.com/firebasejs/12.1.0/firebase-app.js">
+<link rel="modulepreload" href="https://www.gstatic.com/firebasejs/12.1.0/firebase-auth.js">
+<link rel="modulepreload" href="https://www.gstatic.com/firebasejs/12.1.0/firebase-firestore.js">
+
+<!-- Fonts + icon set are not needed to paint the first frame, so they're loaded as
+     non-render-blocking stylesheets (the media="print" swap trick) and only promoted
+     to media="all" once they've actually arrived. <noscript> keeps them working if
+     JS is ever disabled. -->
+<link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Inter:wght@400;500;600;700;800&family=IBM+Plex+Mono:wght@500;600;700&display=swap"
+rel="stylesheet"
+media="print"
+onload="this.media='all'">
 
 <link rel="stylesheet"
-href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.7.2/css/all.min.css">
+href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.7.2/css/all.min.css"
+media="print"
+onload="this.media='all'">
+
+<noscript>
+<link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Inter:wght@400;500;600;700;800&family=IBM+Plex+Mono:wght@500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.7.2/css/all.min.css">
+</noscript>
 
 <style>
 
@@ -101,7 +131,7 @@ h3{font-family:'Inter',Arial,sans-serif}
   display:grid;
   place-items:center;
   z-index:9999;
-  animation:loaderOut .5s 1.1s forwards
+  animation:loaderOut .35s .35s forwards
 }
 
 .loader-mark{
@@ -2804,6 +2834,7 @@ deleteDoc,
 onSnapshot,
 query,
 orderBy,
+limit,
 serverTimestamp
 }
 from
@@ -2846,13 +2877,13 @@ let imgs='';
 
 if(platform==='betpawa'||platform==='both'){
 
-imgs+=`<img class="platform-logo" src="${PLATFORM_LOGOS.betpawa}" alt="BetPawa">`;
+imgs+=`<img class="platform-logo" src="${PLATFORM_LOGOS.betpawa}" alt="BetPawa" loading="lazy" decoding="async">`;
 
 }
 
 if(platform==='sportybet'||platform==='both'){
 
-imgs+=`<img class="platform-logo" src="${PLATFORM_LOGOS.sportybet}" alt="SportyBet">`;
+imgs+=`<img class="platform-logo" src="${PLATFORM_LOGOS.sportybet}" alt="SportyBet" loading="lazy" decoding="async">`;
 
 }
 
@@ -2867,6 +2898,11 @@ let currentUser=null;
 let currentIsAdmin=false;
 
 let stopPosts=null;
+
+// Cache of the last Firestore snapshot for #posts, so the UI can be re-rendered
+// instantly (sign-in, sign-out, refresh button, after a purchase) without tearing
+// down and re-creating the realtime listener each time.
+let latestSnapshot=null;
 
 let selectedPost=null;
 
@@ -3902,14 +3938,6 @@ $('logout').onclick=async()=>{
 
 paymentPolling=false;
 
-if(stopPosts){
-
-stopPosts();
-
-stopPosts=null;
-
-}
-
 await signOut(auth);
 
 currentUser=null;
@@ -3921,6 +3949,12 @@ paidPosts=new Set();
 $('app').style.display='none';
 
 $('home').style.display='block';
+
+// The realtime posts listener stays connected across sign-out — the free tips
+// on the home page keep updating live, and re-subscribing on the next sign-in
+// would just cost an extra round trip for nothing. Just re-render immediately
+// so any admin/paid-only content already in the DOM is hidden right away.
+renderPostsUI(latestSnapshot);
 
 };
 
@@ -4090,24 +4124,85 @@ $('publish').disabled=false;
 
 };
 
+// Subscribes to the "posts" collection exactly once for the whole page session.
+// If a subscription already exists, this just re-renders from the cached
+// snapshot (instant, no network round trip) — used whenever auth state, paid
+// posts, or the visible tab changes.
 function listenPosts(){
 
 if(stopPosts){
 
-stopPosts();
+renderPostsUI(latestSnapshot);
+
+return;
 
 }
 
 const q=
 query(
 collection(db,'posts'),
-orderBy('createdAt','desc')
+orderBy('createdAt','desc'),
+limit(100)
 );
 
 stopPosts=
 onSnapshot(
 q,
 snapshot=>{
+
+latestSnapshot=snapshot;
+
+renderPostsUI(snapshot);
+
+},
+error=>{
+
+console.error(
+'Firestore error:',
+error
+);
+
+const permissionIssue=
+error.code==='permission-denied';
+
+document
+.querySelectorAll('.posts')
+.forEach(box=>{
+
+box.innerHTML=`
+
+<div class="empty">
+
+<i class="fa-solid fa-triangle-exclamation"></i>
+
+<br><br>
+
+${
+permissionIssue
+?
+'Betslips are private right now. Update your Firestore security rules to allow public read access to the "posts" collection.'
+:
+'Unable to load betslips. ('+esc(error.code||error.message||'unknown error')+')'
+}
+
+</div>
+
+`;
+
+});
+
+}
+);
+
+}
+
+function renderPostsUI(snapshot){
+
+if(!snapshot){
+
+return;
+
+}
 
 const boxes=
 document.querySelectorAll('.posts:not(#myBetslipPosts)');
@@ -4604,46 +4699,6 @@ $('deleteModal').style.display='flex';
 });
 
 });
-
-},
-error=>{
-
-console.error(
-'Firestore error:',
-error
-);
-
-const permissionIssue=
-error.code==='permission-denied';
-
-document
-.querySelectorAll('.posts')
-.forEach(box=>{
-
-box.innerHTML=`
-
-<div class="empty">
-
-<i class="fa-solid fa-triangle-exclamation"></i>
-
-<br><br>
-
-${
-permissionIssue
-?
-'Betslips are private right now. Update your Firestore security rules to allow public read access to the "posts" collection.'
-:
-'Unable to load betslips. ('+esc(error.code||error.message||'unknown error')+')'
-}
-
-</div>
-
-`;
-
-});
-
-}
-);
 
 }
 
@@ -5391,7 +5446,7 @@ CSS.escape(postId)+
 
 if(!cards.length){
 
-listenPosts();
+renderPostsUI(latestSnapshot);
 
 return;
 
@@ -5473,7 +5528,7 @@ attachCopyHandlers(card);
 
 });
 
-listenPosts();
+renderPostsUI(latestSnapshot);
 
 }
 
@@ -5506,7 +5561,8 @@ openApp(user);
 
 }
 
-});
+}
+);
 
 listenPosts();
 
