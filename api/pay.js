@@ -1,5 +1,13 @@
 import { adminDb, adminAuth, FieldValue } from "../lib/admin.js";
 
+/*
+ * ===========================================================
+ * STATIC DATA — hoisted to module scope.
+ * Defined once at module load (cold start) instead of once
+ * per request.
+ * ===========================================================
+ */
+
 const MPESA_PREFIXES = new Set([
   "740", "741", "742", "743", "744", "745", "746", "747", "748", "749",
   "750", "751", "752", "753", "754", "755", "756", "757", "758", "759",
@@ -27,11 +35,21 @@ const TTCL_PREFIXES = new Set([
 ]);
 
 /*
- * Vercel Hobby cuts functions at about 10s, so stay under that.
- * If you are on a paid plan you can raise this.
+ * How long we'll wait on PalmPesa before giving up and returning
+ * a clean error to the frontend.
  */
-const PALMPESA_TIMEOUT_MS = 9000;
+const PALMPESA_TIMEOUT_MS = 25000;
 
+/*
+ * NORMALIZE TANZANIAN PHONE NUMBER
+ *
+ * Accepted:
+ *
+ * 0712345678
+ * 0612345678
+ * +255712345678
+ * 255712345678
+ */
 function normalizeTanzaniaPhone(value) {
 
   let p = String(value)
@@ -50,17 +68,43 @@ function normalizeTanzaniaPhone(value) {
   return p;
 }
 
+/*
+ * DETECT NETWORK FROM PREFIX
+ *
+ * Mainly for logging/debugging — not relied on for PalmPesa
+ * routing unless their API explicitly supports it.
+ */
 function detectNetwork(prefix) {
 
-  if (MPESA_PREFIXES.has(prefix)) return "MPESA";
-  if (AIRTEL_PREFIXES.has(prefix)) return "AIRTEL";
-  if (HALOTEL_PREFIXES.has(prefix)) return "HALOPESA";
-  if (MIXX_PREFIXES.has(prefix)) return "MIXX";
-  if (TTCL_PREFIXES.has(prefix)) return "TTCL";
+  if (MPESA_PREFIXES.has(prefix)) {
+    return "MPESA";
+  }
+
+  if (AIRTEL_PREFIXES.has(prefix)) {
+    return "AIRTEL";
+  }
+
+  if (HALOTEL_PREFIXES.has(prefix)) {
+    return "HALOPESA";
+  }
+
+  if (MIXX_PREFIXES.has(prefix)) {
+    return "MIXX";
+  }
+
+  if (TTCL_PREFIXES.has(prefix)) {
+    return "TTCL";
+  }
 
   return "UNKNOWN";
 }
 
+/*
+ * FETCH WITH TIMEOUT
+ *
+ * Wraps fetch with an AbortController so a slow or hung
+ * PalmPesa endpoint fails fast with a clear error.
+ */
 async function fetchWithTimeout(url, options, timeoutMs) {
 
   const controller = new AbortController();
@@ -87,6 +131,9 @@ async function fetchWithTimeout(url, options, timeoutMs) {
 
 export default async function handler(req, res) {
 
+  /*
+   * ONLY POST
+   */
   if (req.method !== "POST") {
     return res.status(405).json({
       success: false,
@@ -113,6 +160,10 @@ export default async function handler(req, res) {
       });
     }
 
+    /*
+     * FRONTEND DATA
+     * (amount is no longer taken from the browser)
+     */
     const { name, email, phone, postId } = req.body || {};
 
     if (!name || !email || !phone || !postId) {
@@ -123,7 +174,7 @@ export default async function handler(req, res) {
     }
 
     /*
-     * PRICE + CONTENT COME FROM THE DATABASE, NEVER FROM THE BROWSER
+     * PRICE COMES FROM THE DATABASE, NEVER FROM THE BROWSER
      */
     const postSnap = await adminDb.doc(`posts/${postId}`).get();
 
@@ -134,18 +185,7 @@ export default async function handler(req, res) {
       });
     }
 
-    const post = postSnap.data();
-
-    const expiresMs = post.expiresAt?.toMillis?.();
-
-    if (expiresMs && expiresMs <= Date.now()) {
-      return res.status(410).json({
-        success: false,
-        message: "This betslip has expired."
-      });
-    }
-
-    const amount = Number(post.price);
+    const amount = Number(postSnap.data().price);
 
     if (!Number.isFinite(amount) || amount <= 0) {
       return res.status(400).json({
@@ -154,18 +194,14 @@ export default async function handler(req, res) {
       });
     }
 
-    /*
-     * Snapshot the VIP content now, so a later delete/expiry
-     * can't leave a paid buyer with nothing.
-     */
-    const secretSnap = await adminDb.doc(`postSecrets/${postId}`).get();
-
-    const vipContent = secretSnap.exists
-      ? (secretSnap.data().content || "")
-      : (post.content || "");
-
     const normalizedPhone = normalizeTanzaniaPhone(phone);
 
+    /*
+     * VALIDATE TANZANIA NUMBER
+     *
+     * Tanzania mobile numbers normally become:
+     * 255XXXXXXXXX
+     */
     if (!/^255\d{9}$/.test(normalizedPhone)) {
       return res.status(400).json({
         success: false,
@@ -174,16 +210,28 @@ export default async function handler(req, res) {
       });
     }
 
+    /*
+     * GET THE PREFIX
+     *
+     * Example: 255712345678
+     *               ^^^
+     */
     const prefix = normalizedPhone.substring(3, 6);
 
     const network = detectNetwork(prefix);
 
+    /*
+     * UNIQUE TRANSACTION ID
+     */
     const transactionId =
       "TXN-" +
       Date.now() +
       "-" +
       Math.floor(Math.random() * 10000);
 
+    /*
+     * PAYMENT DATA
+     */
     const paymentData = {
       name: name,
       email: email,
@@ -206,7 +254,7 @@ export default async function handler(req, res) {
     });
 
     /*
-     * SEND TO PALMPESA
+     * SEND TO PALMPESA — bounded by PALMPESA_TIMEOUT_MS
      */
     let response;
 
@@ -219,8 +267,7 @@ export default async function handler(req, res) {
           headers: {
             "Authorization": `Bearer ${process.env.PALMPESA_TOKEN}`,
             "Content-Type": "application/json",
-            "Accept": "application/json",
-            "User-Agent": "Mozilla/5.0 (compatible; MikekaBoom/1.0)"
+            "Accept": "application/json"
           },
           body: JSON.stringify(paymentData)
         },
@@ -233,27 +280,27 @@ export default async function handler(req, res) {
 
       console.error(
         "PalmPesa request failed:",
-        timedOut ? "timed out" : fetchError.message,
-        "transactionId:",
-        transactionId,
-        "uid:",
-        uid,
-        "postId:",
-        postId
+        timedOut ? "timed out" : fetchError.message
       );
 
       return res.status(504).json({
         success: false,
         message: timedOut
-          ? "The payment service is slow to respond. If a PIN prompt appears on your phone, complete it and wait. Otherwise try again in a few minutes."
-          : "Unable to reach the payment service. Please try again.",
+          ? "PalmPesa is slow to respond. If a PIN prompt appears on your phone, complete it before trying again to avoid paying twice."
+          : "Unable to reach PalmPesa. Please try again.",
         transaction_id: transactionId
       });
 
     }
 
+    /*
+     * READ RAW RESPONSE
+     */
     const rawResponse = await response.text();
 
+    /*
+     * PARSE JSON
+     */
     let data;
 
     try {
@@ -262,6 +309,9 @@ export default async function handler(req, res) {
       data = { raw_response: rawResponse };
     }
 
+    /*
+     * TRY TO FIND ORDER ID
+     */
     const orderId =
       data?.order_id ||
       data?.data?.order_id ||
@@ -272,100 +322,61 @@ export default async function handler(req, res) {
     console.log("PalmPesa response:", {
       httpStatus: response.status,
       orderId,
-      raw: String(rawResponse).slice(0, 500)
+      raw: rawResponse
     });
 
     /*
-     * PROVIDER ERRORS -> CLEAR MESSAGE FOR THE USER
+     * SAVE THE ORDER ON THE SERVER so any later status check
+     * can unlock the right user's betslip.
      */
-    const looksLikeHtml =
-      typeof data?.raw_response === "string" &&
-      data.raw_response.trim().startsWith("<");
+    if (orderId) {
 
-    if (looksLikeHtml) {
-
-      console.error(
-        "PalmPesa returned an HTML page (firewall/captcha/down).",
-        "HTTP:", response.status,
-        "transactionId:", transactionId,
-        "uid:", uid,
-        "postId:", postId
-      );
-
-      return res.status(503).json({
-        success: false,
-        message: "The payment service is temporarily unavailable. You have not been charged. Please try again in a few minutes.",
-        transaction_id: transactionId
+      await adminDb.doc(`orders/${orderId}`).set({
+        uid,
+        postId,
+        amount,
+        phone: normalizedPhone,
+        transactionId,
+        status: "PENDING",
+        createdAt: FieldValue.serverTimestamp()
       });
 
-    }
-
-    const providerMessage =
-      data?.message ||
-      data?.data?.message ||
-      data?.error ||
-      "";
-
-    if (!response.ok) {
-
-      return res.status(502).json({
-        success: false,
-        message: providerMessage || ("The payment provider rejected the request (HTTP " + response.status + ")."),
-        palmPesaStatus: response.status,
-        transaction_id: transactionId
-      });
-
-    }
-
-    if (!orderId) {
+    } else {
 
       console.error(
         "NO ORDER ID from PalmPesa. Raw:",
-        String(rawResponse).slice(0, 500),
-        "uid:", uid,
-        "postId:", postId,
-        "transactionId:", transactionId
+        rawResponse,
+        "uid:",
+        uid,
+        "postId:",
+        postId
       );
-
-      return res.status(502).json({
-        success: false,
-        message: providerMessage || "The payment provider did not return an order ID. Please try again.",
-        transaction_id: transactionId
-      });
 
     }
 
     /*
-     * SAVE THE ORDER (with the content snapshot) so any later
-     * status check can unlock the right user's betslip.
+     * RETURN TO FRONTEND
      */
-    await adminDb.doc(`orders/${orderId}`).set({
-      uid,
-      postId,
-      amount,
-      title: post.title || "",
-      platform: post.platform || "",
-      content: vipContent,
-      phone: normalizedPhone,
-      transactionId,
-      status: "PENDING",
-      createdAt: FieldValue.serverTimestamp()
-    });
-
-    return res.json({
-      success: true,
+    return res.status(response.status).json({
+      success: response.ok,
+      palmPesaStatus: response.status,
       transaction_id: transactionId,
       order_id: orderId,
-      detected_network: network
+      detected_network: network,
+      normalized_phone: normalizedPhone,
+      data: data
     });
 
   } catch (error) {
 
+    /*
+     * SERVER ERROR
+     */
     console.error("PalmPesa payment server error:", error);
 
     return res.status(500).json({
       success: false,
-      message: "Server error while contacting the payment service. Please try again.",
+      message: "Server error while contacting PalmPesa",
       error: error.message
     });
 
