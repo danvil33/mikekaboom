@@ -858,7 +858,7 @@ import{initializeApp}from'https://www.gstatic.com/firebasejs/12.1.0/firebase-app
 
 import{getAuth,onAuthStateChanged,createUserWithEmailAndPassword,signInWithEmailAndPassword,sendPasswordResetEmail,sendEmailVerification,signOut,updateProfile}from'https://www.gstatic.com/firebasejs/12.1.0/firebase-auth.js';
 
-import{getFirestore,doc,setDoc,getDoc,collection,addDoc,getDocs,deleteDoc,onSnapshot,query,orderBy,limit,serverTimestamp}from'https://www.gstatic.com/firebasejs/12.1.0/firebase-firestore.js';
+import{getFirestore,doc,setDoc,getDoc,collection,writeBatch,getDocs,deleteDoc,onSnapshot,query,orderBy,limit,serverTimestamp}from'https://www.gstatic.com/firebasejs/12.1.0/firebase-firestore.js';
 
 const firebaseConfig={
 apiKey:'AIzaSyBEjeRSyKbpEmbNk0SYLUFPp3lbgP9x3Ow',
@@ -901,6 +901,7 @@ let selectedPostId=null;
 let paymentPolling=false;
 let paidPosts=new Set();
 let paidData=new Map();
+let adminSecrets=new Map();
 let deleteTargetId=null;
 let pendingUnlock=null;
 let authStatePushed=false;
@@ -940,6 +941,39 @@ return String(value).replace(/[&<>"']/g,character=>({
 "'":'&#039;',
 '"':'&quot;'
 }[character]));
+}
+
+async function deletePostFully(id){
+await deleteDoc(doc(db,'posts',id));
+try{
+await deleteDoc(doc(db,'postSecrets',id));
+}catch(error){
+console.error('Secret delete failed:',error);
+}
+}
+
+async function loadAdminSecrets(){
+
+adminSecrets=new Map();
+
+if(!currentIsAdmin){
+return;
+}
+
+try{
+
+const snapshot=await getDocs(collection(db,'postSecrets'));
+
+snapshot.forEach(item=>{
+adminSecrets.set(item.id,item.data().content||'');
+});
+
+}catch(error){
+
+console.error('Secrets loading error:',error);
+
+}
+
 }
 
 function queueRerender(){
@@ -1097,7 +1131,7 @@ card.remove();
 }
 
 if(currentIsAdmin&&postId){
-deleteDoc(doc(db,'posts',postId)).catch(error=>{
+deletePostFully(postId).catch(error=>{
 console.error('Expired betslip delete failed:',error);
 });
 }
@@ -1469,6 +1503,8 @@ switchTab('betslips');
 
 await loadPurchases();
 
+await loadAdminSecrets();
+
 listenPosts();
 
 const pending=readPending();
@@ -1656,6 +1692,7 @@ currentUser=null;
 currentIsAdmin=false;
 paidPosts=new Set();
 paidData=new Map();
+adminSecrets=new Map();
 
 $('app').style.display='none';
 $('home').style.display='block';
@@ -1720,9 +1757,15 @@ throw new Error('Bet start time must be in the future.');
 
 const validityHours=(expiresAt.getTime()-Date.now())/3600000;
 
-await addDoc(collection(db,'posts'),{
+const postRef=doc(collection(db,'posts'));
+
+const isPaid=price>0;
+
+const batch=writeBatch(db);
+
+batch.set(postRef,{
 title,
-content,
+content:isPaid?'':content,
 price,
 platform,
 betStartTime:expiresAt,
@@ -1733,6 +1776,16 @@ authorId:currentUser.uid,
 authorName:currentUser.displayName||currentUser.email,
 createdAt:serverTimestamp()
 });
+
+if(isPaid){
+batch.set(doc(db,'postSecrets',postRef.id),{content});
+}
+
+await batch.commit();
+
+if(isPaid){
+adminSecrets.set(postRef.id,content);
+}
 
 $('postTitle').value='';
 $('postContent').value='';
@@ -1832,7 +1885,7 @@ const expiredDocs=snapshot.docs.filter(item=>isExpired(item.data()));
 if(currentIsAdmin&&expiredDocs.length){
 
 expiredDocs.forEach(item=>{
-deleteDoc(doc(db,'posts',item.id)).catch(error=>{
+deletePostFully(item.id).catch(error=>{
 console.error('Auto-delete expired betslip failed:',error);
 });
 });
@@ -1954,7 +2007,7 @@ ${countdown}
 
 </div>
 
-<div class="content-text">${esc(post.content||'')}</div>
+<div class="content-text">${esc(adminSecrets.has(item.id)?adminSecrets.get(item.id):(post.content||''))}</div>
 
 </div>
 
@@ -2210,7 +2263,9 @@ button.innerHTML='<i class="fa-solid fa-spinner fa-spin"></i> DELETING...';
 
 try{
 
-await deleteDoc(doc(db,'posts',id));
+await deletePostFully(id);
+
+adminSecrets.delete(id);
 
 deleteTargetId=null;
 
