@@ -3,8 +3,6 @@ import { adminDb, adminAuth, FieldValue } from "../lib/admin.js";
 /*
  * ===========================================================
  * STATIC DATA — hoisted to module scope.
- * Defined once at module load (cold start) instead of once
- * per request.
  * ===========================================================
  */
 
@@ -34,21 +32,11 @@ const TTCL_PREFIXES = new Set([
   "710", "711", "712", "713", "714", "715", "716", "717", "718", "719"
 ]);
 
-/*
- * How long we'll wait on PalmPesa before giving up and returning
- * a clean error to the frontend.
- */
 const PALMPESA_TIMEOUT_MS = 25000;
 
 /*
  * NORMALIZE TANZANIAN PHONE NUMBER
- *
- * Accepted:
- *
- * 0712345678
- * 0612345678
- * +255712345678
- * 255712345678
+ * Accepted: 0712345678, 0612345678, +255712345678, 255712345678
  */
 function normalizeTanzaniaPhone(value) {
 
@@ -69,41 +57,21 @@ function normalizeTanzaniaPhone(value) {
 }
 
 /*
- * DETECT NETWORK FROM PREFIX
- *
- * Mainly for logging/debugging — not relied on for PalmPesa
- * routing unless their API explicitly supports it.
+ * DETECT NETWORK FROM PREFIX (logging/debugging)
  */
 function detectNetwork(prefix) {
 
-  if (MPESA_PREFIXES.has(prefix)) {
-    return "MPESA";
-  }
-
-  if (AIRTEL_PREFIXES.has(prefix)) {
-    return "AIRTEL";
-  }
-
-  if (HALOTEL_PREFIXES.has(prefix)) {
-    return "HALOPESA";
-  }
-
-  if (MIXX_PREFIXES.has(prefix)) {
-    return "MIXX";
-  }
-
-  if (TTCL_PREFIXES.has(prefix)) {
-    return "TTCL";
-  }
+  if (MPESA_PREFIXES.has(prefix)) return "MPESA";
+  if (AIRTEL_PREFIXES.has(prefix)) return "AIRTEL";
+  if (HALOTEL_PREFIXES.has(prefix)) return "HALOPESA";
+  if (MIXX_PREFIXES.has(prefix)) return "MIXX";
+  if (TTCL_PREFIXES.has(prefix)) return "TTCL";
 
   return "UNKNOWN";
 }
 
 /*
  * FETCH WITH TIMEOUT
- *
- * Wraps fetch with an AbortController so a slow or hung
- * PalmPesa endpoint fails fast with a clear error.
  */
 async function fetchWithTimeout(url, options, timeoutMs) {
 
@@ -161,8 +129,7 @@ export default async function handler(req, res) {
     }
 
     /*
-     * FRONTEND DATA
-     * (amount is no longer taken from the browser)
+     * FRONTEND DATA (amount is never taken from the browser)
      */
     const { name, email, phone, postId } = req.body || {};
 
@@ -174,7 +141,7 @@ export default async function handler(req, res) {
     }
 
     /*
-     * PRICE COMES FROM THE DATABASE, NEVER FROM THE BROWSER
+     * PRICE + CONTENT COME FROM THE DATABASE, NEVER FROM THE BROWSER
      */
     const postSnap = await adminDb.doc(`posts/${postId}`).get();
 
@@ -185,7 +152,21 @@ export default async function handler(req, res) {
       });
     }
 
-    const amount = Number(postSnap.data().price);
+    const post = postSnap.data();
+
+    /*
+     * Refuse to sell a betslip that has already expired
+     */
+    const expiresMs = post.expiresAt?.toMillis?.();
+
+    if (expiresMs && expiresMs <= Date.now()) {
+      return res.status(410).json({
+        success: false,
+        message: "This betslip has expired."
+      });
+    }
+
+    const amount = Number(post.price);
 
     if (!Number.isFinite(amount) || amount <= 0) {
       return res.status(400).json({
@@ -194,13 +175,21 @@ export default async function handler(req, res) {
       });
     }
 
+    /*
+     * SNAPSHOT THE VIP CONTENT NOW.
+     * If the admin deletes the post or it expires before the payment
+     * is confirmed, the buyer still gets what they paid for.
+     */
+    const secretSnap = await adminDb.doc(`postSecrets/${postId}`).get();
+
+    const vipContent = secretSnap.exists
+      ? (secretSnap.data().content || "")
+      : (post.content || "");
+
     const normalizedPhone = normalizeTanzaniaPhone(phone);
 
     /*
-     * VALIDATE TANZANIA NUMBER
-     *
-     * Tanzania mobile numbers normally become:
-     * 255XXXXXXXXX
+     * VALIDATE TANZANIA NUMBER: 255XXXXXXXXX
      */
     if (!/^255\d{9}$/.test(normalizedPhone)) {
       return res.status(400).json({
@@ -210,12 +199,6 @@ export default async function handler(req, res) {
       });
     }
 
-    /*
-     * GET THE PREFIX
-     *
-     * Example: 255712345678
-     *               ^^^
-     */
     const prefix = normalizedPhone.substring(3, 6);
 
     const network = detectNetwork(prefix);
@@ -280,7 +263,13 @@ export default async function handler(req, res) {
 
       console.error(
         "PalmPesa request failed:",
-        timedOut ? "timed out" : fetchError.message
+        timedOut ? "timed out" : fetchError.message,
+        "transactionId:",
+        transactionId,
+        "uid:",
+        uid,
+        "postId:",
+        postId
       );
 
       return res.status(504).json({
@@ -298,9 +287,6 @@ export default async function handler(req, res) {
      */
     const rawResponse = await response.text();
 
-    /*
-     * PARSE JSON
-     */
     let data;
 
     try {
@@ -326,8 +312,9 @@ export default async function handler(req, res) {
     });
 
     /*
-     * SAVE THE ORDER ON THE SERVER so any later status check
-     * can unlock the right user's betslip.
+     * SAVE THE ORDER ON THE SERVER (with the content snapshot) so any
+     * later status check can unlock the right user's betslip, even if
+     * the browser was closed or the post has since been removed.
      */
     if (orderId) {
 
@@ -335,6 +322,9 @@ export default async function handler(req, res) {
         uid,
         postId,
         amount,
+        title: post.title || "",
+        platform: post.platform || "",
+        content: vipContent,
         phone: normalizedPhone,
         transactionId,
         status: "PENDING",
@@ -349,7 +339,9 @@ export default async function handler(req, res) {
         "uid:",
         uid,
         "postId:",
-        postId
+        postId,
+        "transactionId:",
+        transactionId
       );
 
     }
@@ -369,9 +361,6 @@ export default async function handler(req, res) {
 
   } catch (error) {
 
-    /*
-     * SERVER ERROR
-     */
     console.error("PalmPesa payment server error:", error);
 
     return res.status(500).json({
