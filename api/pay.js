@@ -1,5 +1,13 @@
 import { adminDb, adminAuth, FieldValue } from "../lib/admin.js";
 
+/*
+ * ===========================================================
+ * STATIC DATA — hoisted to module scope.
+ * Defined once at module load (cold start) instead of once
+ * per request.
+ * ===========================================================
+ */
+
 const MPESA_PREFIXES = new Set([
   "740", "741", "742", "743", "744", "745", "746", "747", "748", "749",
   "750", "751", "752", "753", "754", "755", "756", "757", "758", "759",
@@ -26,8 +34,22 @@ const TTCL_PREFIXES = new Set([
   "710", "711", "712", "713", "714", "715", "716", "717", "718", "719"
 ]);
 
+/*
+ * How long we'll wait on PalmPesa before giving up and returning
+ * a clean error to the frontend.
+ */
 const PALMPESA_TIMEOUT_MS = 25000;
 
+/*
+ * NORMALIZE TANZANIAN PHONE NUMBER
+ *
+ * Accepted:
+ *
+ * 0712345678
+ * 0612345678
+ * +255712345678
+ * 255712345678
+ */
 function normalizeTanzaniaPhone(value) {
 
   let p = String(value)
@@ -46,6 +68,12 @@ function normalizeTanzaniaPhone(value) {
   return p;
 }
 
+/*
+ * DETECT NETWORK FROM PREFIX
+ *
+ * Mainly for logging/debugging — not relied on for PalmPesa
+ * routing unless their API explicitly supports it.
+ */
 function detectNetwork(prefix) {
 
   if (MPESA_PREFIXES.has(prefix)) {
@@ -71,6 +99,12 @@ function detectNetwork(prefix) {
   return "UNKNOWN";
 }
 
+/*
+ * FETCH WITH TIMEOUT
+ *
+ * Wraps fetch with an AbortController so a slow or hung
+ * PalmPesa endpoint fails fast with a clear error.
+ */
 async function fetchWithTimeout(url, options, timeoutMs) {
 
   const controller = new AbortController();
@@ -97,6 +131,9 @@ async function fetchWithTimeout(url, options, timeoutMs) {
 
 export default async function handler(req, res) {
 
+  /*
+   * ONLY POST
+   */
   if (req.method !== "POST") {
     return res.status(405).json({
       success: false,
@@ -106,6 +143,9 @@ export default async function handler(req, res) {
 
   try {
 
+    /*
+     * WHO IS PAYING? Verify the Firebase login token.
+     */
     const idToken =
       (req.headers.authorization || "").replace("Bearer ", "");
 
@@ -120,6 +160,10 @@ export default async function handler(req, res) {
       });
     }
 
+    /*
+     * FRONTEND DATA
+     * (amount is no longer taken from the browser)
+     */
     const { name, email, phone, postId } = req.body || {};
 
     if (!name || !email || !phone || !postId) {
@@ -129,6 +173,9 @@ export default async function handler(req, res) {
       });
     }
 
+    /*
+     * PRICE COMES FROM THE DATABASE, NEVER FROM THE BROWSER
+     */
     const postSnap = await adminDb.doc(`posts/${postId}`).get();
 
     if (!postSnap.exists) {
@@ -138,9 +185,7 @@ export default async function handler(req, res) {
       });
     }
 
-    const postData = postSnap.data();
-
-    const amount = Number(postData.price);
+    const amount = Number(postSnap.data().price);
 
     if (!Number.isFinite(amount) || amount <= 0) {
       return res.status(400).json({
@@ -149,14 +194,14 @@ export default async function handler(req, res) {
       });
     }
 
-    const secretSnap = await adminDb.doc(`postSecrets/${postId}`).get();
-
-    const betslipContent = secretSnap.exists
-      ? (secretSnap.data().content || "")
-      : (postData.content || "");
-
     const normalizedPhone = normalizeTanzaniaPhone(phone);
 
+    /*
+     * VALIDATE TANZANIA NUMBER
+     *
+     * Tanzania mobile numbers normally become:
+     * 255XXXXXXXXX
+     */
     if (!/^255\d{9}$/.test(normalizedPhone)) {
       return res.status(400).json({
         success: false,
@@ -165,16 +210,28 @@ export default async function handler(req, res) {
       });
     }
 
+    /*
+     * GET THE PREFIX
+     *
+     * Example: 255712345678
+     *               ^^^
+     */
     const prefix = normalizedPhone.substring(3, 6);
 
     const network = detectNetwork(prefix);
 
+    /*
+     * UNIQUE TRANSACTION ID
+     */
     const transactionId =
       "TXN-" +
       Date.now() +
       "-" +
       Math.floor(Math.random() * 10000);
 
+    /*
+     * PAYMENT DATA
+     */
     const paymentData = {
       name: name,
       email: email,
@@ -196,6 +253,9 @@ export default async function handler(req, res) {
       transactionId
     });
 
+    /*
+     * SEND TO PALMPESA — bounded by PALMPESA_TIMEOUT_MS
+     */
     let response;
 
     try {
@@ -233,8 +293,14 @@ export default async function handler(req, res) {
 
     }
 
+    /*
+     * READ RAW RESPONSE
+     */
     const rawResponse = await response.text();
 
+    /*
+     * PARSE JSON
+     */
     let data;
 
     try {
@@ -243,6 +309,9 @@ export default async function handler(req, res) {
       data = { raw_response: rawResponse };
     }
 
+    /*
+     * TRY TO FIND ORDER ID
+     */
     const orderId =
       data?.order_id ||
       data?.data?.order_id ||
@@ -256,6 +325,10 @@ export default async function handler(req, res) {
       raw: rawResponse
     });
 
+    /*
+     * SAVE THE ORDER ON THE SERVER so any later status check
+     * can unlock the right user's betslip.
+     */
     if (orderId) {
 
       await adminDb.doc(`orders/${orderId}`).set({
@@ -264,9 +337,6 @@ export default async function handler(req, res) {
         amount,
         phone: normalizedPhone,
         transactionId,
-        title: postData.title || "",
-        platform: postData.platform || "",
-        content: betslipContent,
         status: "PENDING",
         createdAt: FieldValue.serverTimestamp()
       });
@@ -284,6 +354,9 @@ export default async function handler(req, res) {
 
     }
 
+    /*
+     * RETURN TO FRONTEND
+     */
     return res.status(response.status).json({
       success: response.ok,
       palmPesaStatus: response.status,
@@ -296,6 +369,9 @@ export default async function handler(req, res) {
 
   } catch (error) {
 
+    /*
+     * SERVER ERROR
+     */
     console.error("PalmPesa payment server error:", error);
 
     return res.status(500).json({
