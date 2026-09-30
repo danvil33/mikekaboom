@@ -58,7 +58,18 @@ function normalizeTanzaniaPhone(value) {
 
   let p = String(value)
     .trim()
-    .
+    .replace(/\s+/g, "")
+    .replace(/-/g, "");
+
+  if (p.startsWith("+255")) {
+    p = p.substring(1);
+  }
+
+  if (p.startsWith("0")) {
+    p = "255" + p.substring(1);
+  }
+
+  return p;
 }
 
 /*
@@ -73,7 +84,22 @@ function detectNetwork(prefix) {
     return "MPESA";
   }
 
-  if 
+  if (AIRTEL_PREFIXES.has(prefix)) {
+    return "AIRTEL";
+  }
+
+  if (HALOTEL_PREFIXES.has(prefix)) {
+    return "HALOPESA";
+  }
+
+  if (MIXX_PREFIXES.has(prefix)) {
+    return "MIXX";
+  }
+
+  if (TTCL_PREFIXES.has(prefix)) {
+    return "TTCL";
+  }
+
   return "UNKNOWN";
 }
 
@@ -162,7 +188,17 @@ export default async function handler(req, res) {
      *
      * 255XXXXXXXXX
      */
-    i
+    if (
+      !/^255\d{9}$/.test(normalizedPhone)
+    ) {
+
+      return res.status(400).json({
+        success: false,
+        message:
+          "Invalid Tanzania phone number. Use 07XXXXXXXX, 06XXXXXXXX or +255XXXXXXXXX."
+      });
+
+    }
 
 
     /*
@@ -247,7 +283,22 @@ export default async function handler(req, res) {
     /*
      * SEND TO PALMPESA — bounded by PALMPESA_TIMEOUT_MS so a
      * hung provider doesn't hang this whole request.
-     
+     */
+    let response;
+
+    try {
+
+      response =
+        await fetchWithTimeout(
+          "https://palmpesa.drmlelwa.co.tz/api/pay-via-mobile",
+          {
+            method: "POST",
+
+            headers: {
+
+              "Authorization":
+                `Bearer ${process.env.PALMPESA_TOKEN}`,
+
               "Content-Type":
                 "application/json",
 
@@ -329,7 +380,18 @@ export default async function handler(req, res) {
     const orderId =
       data?.order_id ||
       data?.data?.order_id ||
-   
+      data?.data?.data?.order_id ||
+      data?.order?.order_id ||
+      null;
+
+
+    console.log("PalmPesa response:", {
+      httpStatus: response.status,
+      orderId
+    });
+
+
+    /*
      * RETURN TO FRONTEND
      */
     return res.status(
@@ -338,6 +400,26 @@ export default async function handler(req, res) {
 
       success:
         response.ok,
+
+      palmPesaStatus:
+        response.status,
+
+      transaction_id:
+        transactionId,
+
+      order_id:
+        orderId,
+
+      detected_network:
+        network,
+
+      normalized_phone:
+        normalizedPhone,
+
+      data:
+        data
+
+    });
 
 
   } catch (error) {
@@ -351,4 +433,18 @@ export default async function handler(req, res) {
     );
 
 
-    \
+    return res.status(500).json({
+
+      success: false,
+
+      message:
+        "Server error while contacting PalmPesa",
+
+      error:
+        error.message
+
+    });
+
+  }
+
+}
