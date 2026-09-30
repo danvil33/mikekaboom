@@ -1,12 +1,10 @@
+import { adminDb, adminAuth, FieldValue } from "../lib/admin.js";
+
 /*
  * ===========================================================
  * STATIC DATA — hoisted to module scope.
- *
- * These used to be declared *inside* the handler, which meant
- * every single payment request re-allocated five arrays and a
- * closure from scratch before doing any real work. Defining
- * them once at module load time (cold start) instead of once
- * per request is free performance.
+ * Defined once at module load (cold start) instead of once
+ * per request.
  * ===========================================================
  */
 
@@ -38,11 +36,9 @@ const TTCL_PREFIXES = new Set([
 
 /*
  * How long we'll wait on PalmPesa before giving up and returning
- * a clean error to the frontend, instead of hanging until the
- * hosting platform's own (often much longer, and much less
- * informative) function timeout kicks in.
+ * a clean error to the frontend.
  */
-const PALMPESA_TIMEOUT_MS = 15000;
+const PALMPESA_TIMEOUT_MS = 25000;
 
 /*
  * NORMALIZE TANZANIAN PHONE NUMBER
@@ -107,8 +103,7 @@ function detectNetwork(prefix) {
  * FETCH WITH TIMEOUT
  *
  * Wraps fetch with an AbortController so a slow or hung
- * PalmPesa endpoint fails fast with a clear error instead of
- * holding the request open until the platform kills it.
+ * PalmPesa endpoint fails fast with a clear error.
  */
 async function fetchWithTimeout(url, options, timeoutMs) {
 
@@ -149,72 +144,81 @@ export default async function handler(req, res) {
   try {
 
     /*
-     * FRONTEND DATA
+     * WHO IS PAYING? Verify the Firebase login token.
      */
-    const {
-      name,
-      email,
-      phone,
-      amount,
-      postId,
-      userId
-    } = req.body || {};
+    const idToken =
+      (req.headers.authorization || "").replace("Bearer ", "");
 
+    let uid;
+
+    try {
+      uid = (await adminAuth.verifyIdToken(idToken)).uid;
+    } catch {
+      return res.status(401).json({
+        success: false,
+        message: "Please sign in again."
+      });
+    }
 
     /*
-     * BASIC VALIDATION
+     * FRONTEND DATA
+     * (amount is no longer taken from the browser)
      */
-    if (
-      !name ||
-      !email ||
-      !phone ||
-      !amount
-    ) {
+    const { name, email, phone, postId } = req.body || {};
+
+    if (!name || !email || !phone || !postId) {
       return res.status(400).json({
         success: false,
         message: "All fields are required"
       });
     }
 
+    /*
+     * PRICE COMES FROM THE DATABASE, NEVER FROM THE BROWSER
+     */
+    const postSnap = await adminDb.doc(`posts/${postId}`).get();
 
-    const normalizedPhone =
-      normalizeTanzaniaPhone(phone);
+    if (!postSnap.exists) {
+      return res.status(404).json({
+        success: false,
+        message: "Betslip not found or expired."
+      });
+    }
 
+    const amount = Number(postSnap.data().price);
+
+    if (!Number.isFinite(amount) || amount <= 0) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid betslip price."
+      });
+    }
+
+    const normalizedPhone = normalizeTanzaniaPhone(phone);
 
     /*
      * VALIDATE TANZANIA NUMBER
      *
      * Tanzania mobile numbers normally become:
-     *
      * 255XXXXXXXXX
      */
-    if (
-      !/^255\d{9}$/.test(normalizedPhone)
-    ) {
-
+    if (!/^255\d{9}$/.test(normalizedPhone)) {
       return res.status(400).json({
         success: false,
         message:
           "Invalid Tanzania phone number. Use 07XXXXXXXX, 06XXXXXXXX or +255XXXXXXXXX."
       });
-
     }
-
 
     /*
      * GET THE PREFIX
      *
-     * Example:
-     *
-     * 255712345678
-     *      ^^^
+     * Example: 255712345678
+     *               ^^^
      */
-    const prefix =
-      normalizedPhone.substring(3, 6);
+    const prefix = normalizedPhone.substring(3, 6);
 
-    const network =
-      detectNetwork(prefix);
-
+    const network = detectNetwork(prefix);
 
     /*
      * UNIQUE TRANSACTION ID
@@ -223,103 +227,56 @@ export default async function handler(req, res) {
       "TXN-" +
       Date.now() +
       "-" +
-      Math.floor(
-        Math.random() * 10000
-      );
-
+      Math.floor(Math.random() * 10000);
 
     /*
      * PAYMENT DATA
-     *
-     * IMPORTANT:
-     *
-     * The original PalmPesa fields are preserved.
-     *
-     * `network` is added for debugging / possible
-     * provider routing.
      */
     const paymentData = {
-
       name: name,
-
       email: email,
-
       phone: normalizedPhone,
-
-      amount: Number(amount),
-
+      amount: amount,
       transaction_id: transactionId,
-
       address: "Geita",
-
       postcode: "30100",
-
       network: network
-
     };
 
-
-    /*
-     * SERVER DEBUG LOG
-     *
-     * Collapsed into a single structured log line instead of a
-     * dozen separate console.log calls — each one is a
-     * synchronous write, and on most serverless platforms that
-     * adds up to real latency on every request.
-     */
     console.log("PalmPesa payment request:", {
-      name,
-      phone,
+      uid,
+      postId,
       normalizedPhone,
       prefix,
       network,
-      amount: Number(amount),
-      postId: postId || "not provided",
-      userId: userId || "not provided",
+      amount,
       transactionId
     });
 
-
     /*
-     * SEND TO PALMPESA — bounded by PALMPESA_TIMEOUT_MS so a
-     * hung provider doesn't hang this whole request.
+     * SEND TO PALMPESA — bounded by PALMPESA_TIMEOUT_MS
      */
     let response;
 
     try {
 
-      response =
-        await fetchWithTimeout(
-          "https://palmpesa.drmlelwa.co.tz/api/pay-via-mobile",
-          {
-            method: "POST",
-
-            headers: {
-
-              "Authorization":
-                `Bearer ${process.env.PALMPESA_TOKEN}`,
-
-              "Content-Type":
-                "application/json",
-
-              "Accept":
-                "application/json"
-
-            },
-
-            body:
-              JSON.stringify(
-                paymentData
-              )
-
+      response = await fetchWithTimeout(
+        "https://palmpesa.drmlelwa.co.tz/api/pay-via-mobile",
+        {
+          method: "POST",
+          headers: {
+            "Authorization": `Bearer ${process.env.PALMPESA_TOKEN}`,
+            "Content-Type": "application/json",
+            "Accept": "application/json"
           },
-          PALMPESA_TIMEOUT_MS
-        );
+          body: JSON.stringify(paymentData)
+        },
+        PALMPESA_TIMEOUT_MS
+      );
 
     } catch (fetchError) {
 
-      const timedOut =
-        fetchError.name === "AbortError";
+      const timedOut = fetchError.name === "AbortError";
 
       console.error(
         "PalmPesa request failed:",
@@ -327,27 +284,19 @@ export default async function handler(req, res) {
       );
 
       return res.status(504).json({
-
         success: false,
-
-        message:
-          timedOut
-            ? "PalmPesa did not respond in time. Please try again."
-            : "Unable to reach PalmPesa. Please try again.",
-
+        message: timedOut
+          ? "PalmPesa is slow to respond. If a PIN prompt appears on your phone, complete it before trying again to avoid paying twice."
+          : "Unable to reach PalmPesa. Please try again.",
         transaction_id: transactionId
-
       });
 
     }
 
-
     /*
      * READ RAW RESPONSE
      */
-    const rawResponse =
-      await response.text();
-
+    const rawResponse = await response.text();
 
     /*
      * PARSE JSON
@@ -355,27 +304,13 @@ export default async function handler(req, res) {
     let data;
 
     try {
-
-      data =
-        JSON.parse(
-          rawResponse
-        );
-
+      data = JSON.parse(rawResponse);
     } catch {
-
-      data = {
-        raw_response:
-          rawResponse
-      };
-
+      data = { raw_response: rawResponse };
     }
-
 
     /*
      * TRY TO FIND ORDER ID
-     *
-     * Different API response structures
-     * are handled.
      */
     const orderId =
       data?.order_id ||
@@ -384,65 +319,65 @@ export default async function handler(req, res) {
       data?.order?.order_id ||
       null;
 
-
     console.log("PalmPesa response:", {
       httpStatus: response.status,
-      orderId
+      orderId,
+      raw: rawResponse
     });
 
+    /*
+     * SAVE THE ORDER ON THE SERVER so any later status check
+     * can unlock the right user's betslip.
+     */
+    if (orderId) {
+
+      await adminDb.doc(`orders/${orderId}`).set({
+        uid,
+        postId,
+        amount,
+        phone: normalizedPhone,
+        transactionId,
+        status: "PENDING",
+        createdAt: FieldValue.serverTimestamp()
+      });
+
+    } else {
+
+      console.error(
+        "NO ORDER ID from PalmPesa. Raw:",
+        rawResponse,
+        "uid:",
+        uid,
+        "postId:",
+        postId
+      );
+
+    }
 
     /*
      * RETURN TO FRONTEND
      */
-    return res.status(
-      response.status
-    ).json({
-
-      success:
-        response.ok,
-
-      palmPesaStatus:
-        response.status,
-
-      transaction_id:
-        transactionId,
-
-      order_id:
-        orderId,
-
-      detected_network:
-        network,
-
-      normalized_phone:
-        normalizedPhone,
-
-      data:
-        data
-
+    return res.status(response.status).json({
+      success: response.ok,
+      palmPesaStatus: response.status,
+      transaction_id: transactionId,
+      order_id: orderId,
+      detected_network: network,
+      normalized_phone: normalizedPhone,
+      data: data
     });
-
 
   } catch (error) {
 
     /*
      * SERVER ERROR
      */
-    console.error(
-      "PalmPesa payment server error:",
-      error
-    );
-
+    console.error("PalmPesa payment server error:", error);
 
     return res.status(500).json({
-
       success: false,
-
-      message:
-        "Server error while contacting PalmPesa",
-
-      error:
-        error.message
-
+      message: "Server error while contacting PalmPesa",
+      error: error.message
     });
 
   }
