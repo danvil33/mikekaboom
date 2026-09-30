@@ -26,9 +26,11 @@ function classify(raw) {
 }
 
 async function grantPurchase(orderId) {
+
   const orderRef = adminDb.doc(`orders/${orderId}`);
 
   await adminDb.runTransaction(async (tx) => {
+
     const orderSnap = await tx.get(orderRef);
 
     if (!orderSnap.exists) {
@@ -37,18 +39,35 @@ async function grantPurchase(orderId) {
     }
 
     const order = orderSnap.data();
+
     if (order.status === "COMPLETED") return;
 
-    const postSnap = await tx.get(adminDb.doc(`posts/${order.postId}`));
-    const post = postSnap.exists ? postSnap.data() : {};
+    let title = order.title || "";
+    let content = order.content || "";
+    let platform = order.platform || "";
+
+    if (!content) {
+
+      const postSnap = await tx.get(adminDb.doc(`posts/${order.postId}`));
+      const secretSnap = await tx.get(adminDb.doc(`postSecrets/${order.postId}`));
+
+      const post = postSnap.exists ? postSnap.data() : {};
+
+      title = title || post.title || "";
+      platform = platform || post.platform || "";
+      content = secretSnap.exists
+        ? (secretSnap.data().content || "")
+        : (post.content || "");
+
+    }
 
     tx.set(adminDb.doc(`people/${order.uid}/purchases/${order.postId}`), {
       postId: order.postId,
       orderId,
       amount: order.amount,
-      title: post.title || "",
-      content: post.content || "",
-      platform: post.platform || "",
+      title,
+      content,
+      platform,
       status: "COMPLETED",
       paidAt: FieldValue.serverTimestamp()
     });
@@ -57,7 +76,9 @@ async function grantPurchase(orderId) {
       status: "COMPLETED",
       completedAt: FieldValue.serverTimestamp()
     });
+
   });
+
 }
 
 export default async function handler(req, res) {
@@ -101,6 +122,7 @@ export default async function handler(req, res) {
     console.log("PalmPesa status response:", rawResponse);
 
     let data;
+
     try {
       data = JSON.parse(rawResponse);
     } catch {
@@ -123,6 +145,7 @@ export default async function handler(req, res) {
     const status = classify(rawStatus);
 
     const normalized = normalizeStatus(rawStatus);
+
     if (
       !SUCCESS.has(normalized) &&
       !FAILURE.has(normalized) &&
@@ -137,15 +160,22 @@ export default async function handler(req, res) {
     }
 
     if (status === "COMPLETED") {
+
       try {
+
         await grantPurchase(order_id);
+
       } catch (grantError) {
+
         console.error("grantPurchase failed:", order_id, grantError);
+
         return res.status(500).json({
           success: false,
           message: "Payment confirmed but unlock failed. Retrying."
         });
+
       }
+
     }
 
     return res.status(response.ok ? 200 : response.status).json({
