@@ -895,6 +895,7 @@ let signup=false;
 let currentUser=null;
 let currentIsAdmin=false;
 let stopPosts=null;
+let stopPurchases=null;
 let latestSnapshot=null;
 let selectedPost=null;
 let selectedPostId=null;
@@ -908,6 +909,7 @@ let authStatePushed=false;
 let paymentStatePushed=false;
 let activePollOrder=null;
 let rerenderTimer=null;
+let syncing=false;
 
 const PENDING_KEY='mb_pending_order';
 
@@ -1210,6 +1212,24 @@ profileSaveBtn.disabled=false;
 
 }
 
+function applyPurchases(snapshot){
+
+paidPosts=new Set();
+paidData=new Map();
+
+snapshot.forEach(item=>{
+
+const data=item.data();
+
+if(data.status==='COMPLETED'){
+paidPosts.add(item.id);
+paidData.set(item.id,data);
+}
+
+});
+
+}
+
 async function loadPurchases(){
 
 paidPosts=new Set();
@@ -1225,16 +1245,7 @@ const purchasesRef=collection(db,'people',currentUser.uid,'purchases');
 
 const snapshot=await getDocs(purchasesRef);
 
-snapshot.forEach(item=>{
-
-const data=item.data();
-
-if(data.status==='COMPLETED'){
-paidPosts.add(item.id);
-paidData.set(item.id,data);
-}
-
-});
+applyPurchases(snapshot);
 
 }catch(error){
 
@@ -1243,6 +1254,86 @@ console.error('Purchase loading error:',error);
 }
 
 }
+
+/*
+ * LIVE PURCHASES LISTENER
+ * The moment the server records a payment, the betslip unlocks —
+ * even if the payment finished while the user was away.
+ */
+function listenPurchases(){
+
+if(stopPurchases||!currentUser){
+return;
+}
+
+stopPurchases=onSnapshot(
+collection(db,'people',currentUser.uid,'purchases'),
+snapshot=>{
+applyPurchases(snapshot);
+queueRerender();
+},
+error=>{
+console.error('Purchases listener error:',error);
+}
+);
+
+}
+
+/*
+ * ORDER SYNC
+ * Asks the server to re-check every pending order this user has,
+ * so a payment completed while the browser was closed still unlocks.
+ */
+async function syncOrders(){
+
+if(!currentUser||currentIsAdmin||syncing){
+return;
+}
+
+syncing=true;
+
+try{
+
+const token=await currentUser.getIdToken();
+
+await fetch('/api/order-status',{
+method:'POST',
+headers:{
+'Content-Type':'application/json',
+'Authorization':'Bearer '+token
+},
+body:JSON.stringify({sync:true})
+});
+
+}catch(error){
+
+console.error('Order sync failed:',error);
+
+}finally{
+
+syncing=false;
+
+}
+
+}
+
+document.addEventListener('visibilitychange',()=>{
+if(document.visibilityState==='visible'&&currentUser){
+syncOrders();
+}
+});
+
+window.addEventListener('online',()=>{
+if(currentUser){
+syncOrders();
+}
+});
+
+setInterval(()=>{
+if(currentUser&&!currentIsAdmin&&document.visibilityState==='visible'){
+syncOrders();
+}
+},30000);
 
 function promptSignIn(text){
 
@@ -1501,7 +1592,15 @@ populateProfile(user,data);
 
 switchTab('betslips');
 
+/*
+ * Settle any payment that finished while the user was away,
+ * then load purchases and keep them live.
+ */
+await syncOrders();
+
 await loadPurchases();
+
+listenPurchases();
 
 await loadAdminSecrets();
 
@@ -1685,6 +1784,11 @@ $('logout').onclick=async()=>{
 
 paymentPolling=false;
 activePollOrder=null;
+
+if(stopPurchases){
+stopPurchases();
+stopPurchases=null;
+}
 
 await signOut(auth);
 
@@ -2024,6 +2128,9 @@ DELETE BETSLIP
 
 if(paidPosts.has(item.id)){
 
+const purchase=paidData.get(item.id);
+const paidContent=(purchase&&purchase.content)||post.content||'';
+
 return `
 
 <article class="post-card unlocked" data-post-id="${item.id}">
@@ -2055,7 +2162,7 @@ ${countdown}
 
 </div>
 
-<div class="content-text">${esc(post.content||'')}</div>
+<div class="content-text">${esc(paidContent)}</div>
 
 </div>
 
@@ -2587,9 +2694,20 @@ while(activePollOrder===orderId&&Date.now()<deadline){
 
 try{
 
+if(!currentUser){
+activePollOrder=null;
+paymentPolling=false;
+return;
+}
+
+const token=await currentUser.getIdToken();
+
 const response=await fetch('/api/order-status',{
 method:'POST',
-headers:{'Content-Type':'application/json'},
+headers:{
+'Content-Type':'application/json',
+'Authorization':'Bearer '+token
+},
 body:JSON.stringify({order_id:orderId})
 });
 
@@ -2727,6 +2845,8 @@ $('refreshPosts').onclick=async()=>{
 const icon=$('refreshPosts').querySelector('i');
 
 icon.classList.add('fa-spin');
+
+await syncOrders();
 
 await loadPurchases();
 
