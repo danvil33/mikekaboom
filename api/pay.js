@@ -1,11 +1,5 @@
 import { adminDb, adminAuth, FieldValue } from "../lib/admin.js";
 
-/*
- * ===========================================================
- * STATIC DATA — hoisted to module scope.
- * ===========================================================
- */
-
 const MPESA_PREFIXES = new Set([
   "740", "741", "742", "743", "744", "745", "746", "747", "748", "749",
   "750", "751", "752", "753", "754", "755", "756", "757", "758", "759",
@@ -32,12 +26,12 @@ const TTCL_PREFIXES = new Set([
   "710", "711", "712", "713", "714", "715", "716", "717", "718", "719"
 ]);
 
-const PALMPESA_TIMEOUT_MS = 25000;
-
 /*
- * NORMALIZE TANZANIAN PHONE NUMBER
- * Accepted: 0712345678, 0612345678, +255712345678, 255712345678
+ * Vercel Hobby cuts functions at about 10s, so stay under that.
+ * If you are on a paid plan you can raise this.
  */
+const PALMPESA_TIMEOUT_MS = 9000;
+
 function normalizeTanzaniaPhone(value) {
 
   let p = String(value)
@@ -56,9 +50,6 @@ function normalizeTanzaniaPhone(value) {
   return p;
 }
 
-/*
- * DETECT NETWORK FROM PREFIX (logging/debugging)
- */
 function detectNetwork(prefix) {
 
   if (MPESA_PREFIXES.has(prefix)) return "MPESA";
@@ -70,9 +61,6 @@ function detectNetwork(prefix) {
   return "UNKNOWN";
 }
 
-/*
- * FETCH WITH TIMEOUT
- */
 async function fetchWithTimeout(url, options, timeoutMs) {
 
   const controller = new AbortController();
@@ -99,9 +87,6 @@ async function fetchWithTimeout(url, options, timeoutMs) {
 
 export default async function handler(req, res) {
 
-  /*
-   * ONLY POST
-   */
   if (req.method !== "POST") {
     return res.status(405).json({
       success: false,
@@ -128,9 +113,6 @@ export default async function handler(req, res) {
       });
     }
 
-    /*
-     * FRONTEND DATA (amount is never taken from the browser)
-     */
     const { name, email, phone, postId } = req.body || {};
 
     if (!name || !email || !phone || !postId) {
@@ -154,9 +136,6 @@ export default async function handler(req, res) {
 
     const post = postSnap.data();
 
-    /*
-     * Refuse to sell a betslip that has already expired
-     */
     const expiresMs = post.expiresAt?.toMillis?.();
 
     if (expiresMs && expiresMs <= Date.now()) {
@@ -176,9 +155,8 @@ export default async function handler(req, res) {
     }
 
     /*
-     * SNAPSHOT THE VIP CONTENT NOW.
-     * If the admin deletes the post or it expires before the payment
-     * is confirmed, the buyer still gets what they paid for.
+     * Snapshot the VIP content now, so a later delete/expiry
+     * can't leave a paid buyer with nothing.
      */
     const secretSnap = await adminDb.doc(`postSecrets/${postId}`).get();
 
@@ -188,9 +166,6 @@ export default async function handler(req, res) {
 
     const normalizedPhone = normalizeTanzaniaPhone(phone);
 
-    /*
-     * VALIDATE TANZANIA NUMBER: 255XXXXXXXXX
-     */
     if (!/^255\d{9}$/.test(normalizedPhone)) {
       return res.status(400).json({
         success: false,
@@ -203,18 +178,12 @@ export default async function handler(req, res) {
 
     const network = detectNetwork(prefix);
 
-    /*
-     * UNIQUE TRANSACTION ID
-     */
     const transactionId =
       "TXN-" +
       Date.now() +
       "-" +
       Math.floor(Math.random() * 10000);
 
-    /*
-     * PAYMENT DATA
-     */
     const paymentData = {
       name: name,
       email: email,
@@ -237,7 +206,7 @@ export default async function handler(req, res) {
     });
 
     /*
-     * SEND TO PALMPESA — bounded by PALMPESA_TIMEOUT_MS
+     * SEND TO PALMPESA
      */
     let response;
 
@@ -250,7 +219,8 @@ export default async function handler(req, res) {
           headers: {
             "Authorization": `Bearer ${process.env.PALMPESA_TOKEN}`,
             "Content-Type": "application/json",
-            "Accept": "application/json"
+            "Accept": "application/json",
+            "User-Agent": "Mozilla/5.0 (compatible; MikekaBoom/1.0)"
           },
           body: JSON.stringify(paymentData)
         },
@@ -275,16 +245,13 @@ export default async function handler(req, res) {
       return res.status(504).json({
         success: false,
         message: timedOut
-          ? "PalmPesa is slow to respond. If a PIN prompt appears on your phone, complete it before trying again to avoid paying twice."
-          : "Unable to reach PalmPesa. Please try again.",
+          ? "The payment service is slow to respond. If a PIN prompt appears on your phone, complete it and wait. Otherwise try again in a few minutes."
+          : "Unable to reach the payment service. Please try again.",
         transaction_id: transactionId
       });
 
     }
 
-    /*
-     * READ RAW RESPONSE
-     */
     const rawResponse = await response.text();
 
     let data;
@@ -295,9 +262,6 @@ export default async function handler(req, res) {
       data = { raw_response: rawResponse };
     }
 
-    /*
-     * TRY TO FIND ORDER ID
-     */
     const orderId =
       data?.order_id ||
       data?.data?.order_id ||
@@ -308,55 +272,91 @@ export default async function handler(req, res) {
     console.log("PalmPesa response:", {
       httpStatus: response.status,
       orderId,
-      raw: rawResponse
+      raw: String(rawResponse).slice(0, 500)
     });
 
     /*
-     * SAVE THE ORDER ON THE SERVER (with the content snapshot) so any
-     * later status check can unlock the right user's betslip, even if
-     * the browser was closed or the post has since been removed.
+     * PROVIDER ERRORS -> CLEAR MESSAGE FOR THE USER
      */
-    if (orderId) {
+    const looksLikeHtml =
+      typeof data?.raw_response === "string" &&
+      data.raw_response.trim().startsWith("<");
 
-      await adminDb.doc(`orders/${orderId}`).set({
-        uid,
-        postId,
-        amount,
-        title: post.title || "",
-        platform: post.platform || "",
-        content: vipContent,
-        phone: normalizedPhone,
-        transactionId,
-        status: "PENDING",
-        createdAt: FieldValue.serverTimestamp()
+    if (looksLikeHtml) {
+
+      console.error(
+        "PalmPesa returned an HTML page (firewall/captcha/down).",
+        "HTTP:", response.status,
+        "transactionId:", transactionId,
+        "uid:", uid,
+        "postId:", postId
+      );
+
+      return res.status(503).json({
+        success: false,
+        message: "The payment service is temporarily unavailable. You have not been charged. Please try again in a few minutes.",
+        transaction_id: transactionId
       });
 
-    } else {
+    }
+
+    const providerMessage =
+      data?.message ||
+      data?.data?.message ||
+      data?.error ||
+      "";
+
+    if (!response.ok) {
+
+      return res.status(502).json({
+        success: false,
+        message: providerMessage || ("The payment provider rejected the request (HTTP " + response.status + ")."),
+        palmPesaStatus: response.status,
+        transaction_id: transactionId
+      });
+
+    }
+
+    if (!orderId) {
 
       console.error(
         "NO ORDER ID from PalmPesa. Raw:",
-        rawResponse,
-        "uid:",
-        uid,
-        "postId:",
-        postId,
-        "transactionId:",
-        transactionId
+        String(rawResponse).slice(0, 500),
+        "uid:", uid,
+        "postId:", postId,
+        "transactionId:", transactionId
       );
+
+      return res.status(502).json({
+        success: false,
+        message: providerMessage || "The payment provider did not return an order ID. Please try again.",
+        transaction_id: transactionId
+      });
 
     }
 
     /*
-     * RETURN TO FRONTEND
+     * SAVE THE ORDER (with the content snapshot) so any later
+     * status check can unlock the right user's betslip.
      */
-    return res.status(response.status).json({
-      success: response.ok,
-      palmPesaStatus: response.status,
+    await adminDb.doc(`orders/${orderId}`).set({
+      uid,
+      postId,
+      amount,
+      title: post.title || "",
+      platform: post.platform || "",
+      content: vipContent,
+      phone: normalizedPhone,
+      transactionId,
+      status: "PENDING",
+      createdAt: FieldValue.serverTimestamp()
+    });
+
+    return res.json({
+      success: true,
       transaction_id: transactionId,
       order_id: orderId,
-      detected_network: network,
-      normalized_phone: normalizedPhone,
-      data: data
+      detected_network: network
     });
 
   } catch (error) {
@@ -365,7 +365,7 @@ export default async function handler(req, res) {
 
     return res.status(500).json({
       success: false,
-      message: "Server error while contacting PalmPesa",
+      message: "Server error while contacting the payment service. Please try again.",
       error: error.message
     });
 
