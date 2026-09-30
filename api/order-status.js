@@ -14,6 +14,18 @@ const PENDING = new Set([
   "PENDING", "PROCESSING", "INITIATED", "WAITING", "QUEUED", "IN_PROGRESS"
 ]);
 
+/*
+ * Never ask PalmPesa about the same order more often than this.
+ * Too many requests from a datacenter IP can trigger their bot filter.
+ */
+const MIN_CHECK_GAP_MS = 8000;
+
+/*
+ * Orders older than this that still say PENDING are marked ABANDONED
+ * so we stop asking PalmPesa about them forever.
+ */
+const ABANDON_AFTER_MS = 3 * 24 * 3600 * 1000;
+
 function normalizeStatus(raw) {
   return String(raw || "").trim().toUpperCase().replace(/[\s-]+/g, "_");
 }
@@ -26,14 +38,13 @@ function classify(raw) {
 }
 
 /*
- * Ask PalmPesa for the real status.
- * Throws if PalmPesa is unreachable, so the order stays PENDING
- * and gets retried on the next check.
+ * Ask PalmPesa. Throws if unreachable or blocked so the order
+ * stays PENDING and gets retried later.
  */
 async function fetchPalmStatus(orderId) {
 
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 15000);
+  const timer = setTimeout(() => controller.abort(), 9000);
 
   let response, raw;
 
@@ -44,7 +55,8 @@ async function fetchPalmStatus(orderId) {
       headers: {
         "Authorization": `Bearer ${process.env.PALMPESA_TOKEN}`,
         "Content-Type": "application/json",
-        "Accept": "application/json"
+        "Accept": "application/json",
+        "User-Agent": "Mozilla/5.0 (compatible; MikekaBoom/1.0)"
       },
       body: JSON.stringify({ order_id: orderId }),
       signal: controller.signal
@@ -58,11 +70,20 @@ async function fetchPalmStatus(orderId) {
 
   }
 
-  console.log("PalmPesa status HTTP:", response.status, "order:", orderId);
-  console.log("PalmPesa status response:", raw);
+  const looksLikeHtml = String(raw).trim().startsWith("<");
+
+  console.log("PalmPesa status HTTP:", response.status, "order:", orderId, "html:", looksLikeHtml);
+
+  if (looksLikeHtml) {
+    const err = new Error("PalmPesa returned an HTML page (HTTP " + response.status + "), likely a firewall or captcha block.");
+    err.blocked = true;
+    throw err;
+  }
+
+  console.log("PalmPesa status response:", String(raw).slice(0, 500));
 
   if (!response.ok) {
-    throw new Error("PalmPesa status HTTP " + response.status);
+    throw new Error("PalmPesa status HTTP " + response.status + ": " + String(raw).slice(0, 200));
   }
 
   let data;
@@ -109,8 +130,7 @@ async function fetchPalmStatus(orderId) {
 
 /*
  * Idempotent: safe to run from polling, sync and retries at the same time.
- * The purchase gets the content that was snapshotted into the order at
- * payment time, so it still works if the post was deleted or expired.
+ * Uses the content snapshotted into the order at payment time.
  */
 async function grantPurchase(orderId) {
 
@@ -133,10 +153,6 @@ async function grantPurchase(orderId) {
 
     let { title, content, platform } = order;
 
-    /*
-     * Fallback for orders created before content was snapshotted.
-     * All reads happen before any writes (Firestore transaction rule).
-     */
     if (!content) {
 
       const secretSnap = await tx.get(adminDb.doc(`postSecrets/${order.postId}`));
@@ -174,9 +190,44 @@ async function grantPurchase(orderId) {
 }
 
 /*
- * Check PalmPesa and update our records.
+ * Check PalmPesa (throttled) and update our records.
  */
 async function settleOrder(orderId) {
+
+  const ref = adminDb.doc(`orders/${orderId}`);
+  const snap = await ref.get();
+
+  if (!snap.exists) {
+    return { status: "PENDING", message: "" };
+  }
+
+  const order = snap.data();
+
+  if (order.status === "COMPLETED") {
+    return { status: "COMPLETED", message: "" };
+  }
+
+  if (order.status === "FAILED") {
+    return { status: "FAILED", message: "" };
+  }
+
+  const created = order.createdAt?.toMillis?.() || 0;
+
+  if (created && Date.now() - created > ABANDON_AFTER_MS) {
+    await ref.update({
+      status: "ABANDONED",
+      abandonedAt: FieldValue.serverTimestamp()
+    }).catch(() => {});
+    return { status: "FAILED", message: "This order expired." };
+  }
+
+  const last = order.lastCheckedAt?.toMillis?.() || 0;
+
+  if (Date.now() - last < MIN_CHECK_GAP_MS) {
+    return { status: "PENDING", message: "" };
+  }
+
+  await ref.update({ lastCheckedAt: FieldValue.serverTimestamp() }).catch(() => {});
 
   const result = await fetchPalmStatus(orderId);
 
@@ -186,15 +237,10 @@ async function settleOrder(orderId) {
 
   } else if (result.status === "FAILED") {
 
-    const ref = adminDb.doc(`orders/${orderId}`);
-    const snap = await ref.get();
-
-    if (snap.exists && snap.data().status === "PENDING") {
-      await ref.update({
-        status: "FAILED",
-        failedAt: FieldValue.serverTimestamp()
-      });
-    }
+    await ref.update({
+      status: "FAILED",
+      failedAt: FieldValue.serverTimestamp()
+    }).catch(() => {});
 
   }
 
@@ -211,9 +257,6 @@ export default async function handler(req, res) {
     });
   }
 
-  /*
-   * LOGIN REQUIRED — nobody can probe other people's orders.
-   */
   let uid;
 
   try {
@@ -231,16 +274,14 @@ export default async function handler(req, res) {
     const { order_id, sync } = req.body || {};
 
     /*
-     * SYNC MODE: settle every pending order this user has.
-     * The site calls this on login, tab focus and on a timer, so a payment
-     * completed while the browser was closed still unlocks.
+     * SYNC MODE: settle this user's pending orders.
      */
     if (sync) {
 
       const snap = await adminDb.collection("orders")
         .where("uid", "==", uid)
         .where("status", "==", "PENDING")
-        .limit(10)
+        .limit(5)
         .get();
 
       await Promise.allSettled(snap.docs.map((d) => settleOrder(d.id)));
@@ -253,7 +294,7 @@ export default async function handler(req, res) {
     }
 
     /*
-     * SINGLE ORDER MODE (used by the payment modal)
+     * SINGLE ORDER MODE
      */
     if (!order_id) {
       return res.status(400).json({
@@ -290,7 +331,14 @@ export default async function handler(req, res) {
 
   } catch (error) {
 
-    console.error("Order status error:", error);
+    console.error("Order status error:", error.message);
+
+    if (error.blocked) {
+      return res.status(503).json({
+        success: false,
+        message: "Payment service is busy. Your payment is safe and will unlock automatically once confirmed."
+      });
+    }
 
     return res.status(502).json({
       success: false,
