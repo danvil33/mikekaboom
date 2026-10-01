@@ -945,12 +945,101 @@ return String(value).replace(/[&<>"']/g,character=>({
 
 /* The paid content lives on the buyer's purchase record (the post itself keeps it empty),
    so every unlocked card — in Betslips and in My Betslip — reads it from there. */
+const paidSecrets=new Map();
+
 function paidContentFor(id,post){
-const purchase=paidData.get(id);
-if(purchase&&purchase.content){
-return purchase.content;
+const purchase=paidData.get(id)||{};
+const fromPurchase=purchase.content||purchase.betslip||purchase.secret||purchase.text||'';
+if(fromPurchase){
+return fromPurchase;
+}
+if(paidSecrets.has(id)&&paidSecrets.get(id)){
+return paidSecrets.get(id);
 }
 return (post&&post.content)||'';
+}
+
+/* Paid betslips that were saved before the backend fix have no text on the purchase record.
+   Asking /api/order-status once makes the server fill it in; then we reload the purchases. */
+const repairedOrders=new Set();
+
+async function fillMissingPaidContent(){
+
+if(!currentUser){
+return;
+}
+
+const hasText=id=>{
+const purchase=paidData.get(id)||{};
+return !!(purchase.content||purchase.betslip||purchase.secret||purchase.text);
+};
+
+const missing=[...paidPosts].filter(id=>!hasText(id));
+
+if(!missing.length){
+return;
+}
+
+const toRepair=missing.filter(id=>{
+const orderId=(paidData.get(id)||{}).orderId;
+return orderId&&!repairedOrders.has(orderId);
+});
+
+if(toRepair.length){
+
+await Promise.all(toRepair.map(async id=>{
+
+const orderId=paidData.get(id).orderId;
+
+repairedOrders.add(orderId);
+
+try{
+
+await fetch('/api/order-status',{
+method:'POST',
+headers:{'Content-Type':'application/json'},
+body:JSON.stringify({order_id:orderId})
+});
+
+}catch(error){
+
+console.warn('Repair check failed for',orderId,error);
+
+}
+
+}));
+
+try{
+
+const snapshot=await getDocs(collection(db,'people',currentUser.uid,'purchases'));
+
+const ids=new Set();
+const data=new Map();
+
+snapshot.forEach(item=>{
+
+const d=item.data();
+
+if(d.status==='COMPLETED'){
+ids.add(item.id);
+data.set(item.id,d);
+}
+
+});
+
+paidPosts=ids;
+paidData=data;
+
+}catch(error){
+
+console.error('Purchase reload failed:',error);
+
+}
+
+}
+
+queueRerender();
+
 }
 
 async function deletePostFully(id){
@@ -1513,6 +1602,8 @@ switchTab('betslips');
 
 await loadPurchases();
 
+fillMissingPaidContent();
+
 await loadAdminSecrets();
 
 listenPosts();
@@ -1703,6 +1794,7 @@ currentIsAdmin=false;
 paidPosts=new Set();
 paidData=new Map();
 adminSecrets=new Map();
+paidSecrets.clear();
 
 $('app').style.display='none';
 $('home').style.display='block';
@@ -2065,7 +2157,7 @@ ${countdown}
 
 </div>
 
-<div class="content-text">${esc(paidContentFor(item.id,post))}</div>
+<div class="content-text">${esc(paidContentFor(item.id,post)||'Your payment is confirmed but the betslip text could not be loaded. Tap REFRESH, or contact support with your payment.')}</div>
 
 </div>
 
@@ -2620,6 +2712,8 @@ clearPending();
 
 await loadPurchases();
 
+await fillMissingPaidContent();
+
 if(!paidPosts.has(postId)){
 
 if(uiOpen()){
@@ -2739,6 +2833,8 @@ const icon=$('refreshPosts').querySelector('i');
 icon.classList.add('fa-spin');
 
 await loadPurchases();
+
+fillMissingPaidContent();
 
 listenPosts();
 
