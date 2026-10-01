@@ -25,6 +25,17 @@ function classify(raw) {
   return "PENDING";
 }
 
+/*
+ * Gives the buyer their purchase record, INCLUDING the betslip text.
+ *
+ * Paid betslips keep posts/{id}.content EMPTY — the real text is stored in
+ * postSecrets/{id}. The old code copied post.content, so every purchase was
+ * saved with an empty content field. We now read the secret first.
+ *
+ * It also repairs purchases that were already saved with empty content:
+ * if the order is already COMPLETED but the purchase has no text, the text
+ * is filled in.
+ */
 async function grantPurchase(orderId) {
   const orderRef = adminDb.doc(`orders/${orderId}`);
 
@@ -37,17 +48,55 @@ async function grantPurchase(orderId) {
     }
 
     const order = orderSnap.data();
-    if (order.status === "COMPLETED") return;
 
-    const postSnap = await tx.get(adminDb.doc(`posts/${order.postId}`));
+    const purchaseRef = adminDb.doc(
+      `people/${order.uid}/purchases/${order.postId}`
+    );
+
+    const [postSnap, secretSnap, purchaseSnap] = await Promise.all([
+      tx.get(adminDb.doc(`posts/${order.postId}`)),
+      tx.get(adminDb.doc(`postSecrets/${order.postId}`)),
+      tx.get(purchaseRef)
+    ]);
+
     const post = postSnap.exists ? postSnap.data() : {};
+    const secretContent = secretSnap.exists
+      ? (secretSnap.data().content || "")
+      : "";
 
-    tx.set(adminDb.doc(`people/${order.uid}/purchases/${order.postId}`), {
+    const content = secretContent || post.content || "";
+
+    if (order.status === "COMPLETED") {
+
+      // Already granted — only repair a purchase that has no text yet.
+      if (!purchaseSnap.exists) {
+
+        tx.set(purchaseRef, {
+          postId: order.postId,
+          orderId,
+          amount: order.amount,
+          title: post.title || "",
+          content,
+          platform: post.platform || "",
+          status: "COMPLETED",
+          paidAt: FieldValue.serverTimestamp()
+        });
+
+      } else if (!purchaseSnap.data().content && content) {
+
+        tx.update(purchaseRef, { content });
+
+      }
+
+      return;
+    }
+
+    tx.set(purchaseRef, {
       postId: order.postId,
       orderId,
       amount: order.amount,
       title: post.title || "",
-      content: post.content || "",
+      content,
       platform: post.platform || "",
       status: "COMPLETED",
       paidAt: FieldValue.serverTimestamp()
