@@ -199,7 +199,7 @@ h3{font-family:'Inter',Arial,sans-serif}
 .copy-btn{flex-shrink:0;border:1.5px solid var(--panel-line);background:var(--paper);color:var(--ink-soft);font-size:11px;font-weight:700;width:27px;height:27px;border-radius:5px;display:inline-flex;align-items:center;justify-content:center;transition:border-color .15s ease,color .15s ease,background .15s ease}
 .copy-btn:hover{border-color:var(--stamp);color:var(--stamp-deep)}
 .copy-btn.copied{background:var(--pitch-tint);color:var(--pitch-deep);border-color:var(--pitch)}
-.content-text{color:var(--ink);line-height:1.7;white-space:pre-wrap;font-size:14px;font-family:'IBM Plex Mono',monospace}
+.content-text{color:var(--ink);line-height:1.7;white-space:pre-wrap;font-size:14px;font-family:'IBM Plex Mono',monospace;word-break:break-word}
 .admin-content{background:var(--violet-tint);border-color:rgba(75,60,134,.3)}
 .admin-content .unlocked-header{color:var(--violet)}
 .delete-button{width:100%;margin-top:18px;padding:11px 15px;border:1.5px dashed var(--danger);border-radius:var(--radius-sm);background:var(--danger-tint);color:var(--danger);font-weight:700;font-size:13px;display:flex;align-items:center;justify-content:center;gap:8px;transition:.15s ease}
@@ -895,6 +895,7 @@ let signup=false;
 let currentUser=null;
 let currentIsAdmin=false;
 let stopPosts=null;
+let stopPurchases=null;
 let latestSnapshot=null;
 let selectedPost=null;
 let selectedPostId=null;
@@ -941,6 +942,15 @@ return String(value).replace(/[&<>"']/g,character=>({
 "'":'&#039;',
 '"':'&quot;'
 }[character]));
+}
+
+/* Content the buyer paid for: stored on the purchase record (paid posts keep an empty content field). */
+function paidContentFor(id,post){
+const purchase=paidData.get(id);
+if(purchase&&purchase.content){
+return purchase.content;
+}
+return (post&&post.content)||'';
 }
 
 async function deletePostFully(id){
@@ -1244,6 +1254,63 @@ console.error('Purchase loading error:',error);
 
 }
 
+/* Live listener: as soon as a purchase is marked COMPLETED, the content appears in every tab. */
+function stopPurchasesListener(){
+
+if(stopPurchases){
+try{stopPurchases();}catch(error){}
+stopPurchases=null;
+}
+
+}
+
+function listenPurchases(){
+
+stopPurchasesListener();
+
+if(!currentUser){
+return;
+}
+
+try{
+
+stopPurchases=onSnapshot(
+collection(db,'people',currentUser.uid,'purchases'),
+snapshot=>{
+
+const ids=new Set();
+const data=new Map();
+
+snapshot.forEach(item=>{
+
+const d=item.data();
+
+if(d.status==='COMPLETED'){
+ids.add(item.id);
+data.set(item.id,d);
+}
+
+});
+
+paidPosts=ids;
+paidData=data;
+
+queueRerender();
+
+},
+error=>{
+console.error('Purchases listener error:',error);
+}
+);
+
+}catch(error){
+
+console.error('Purchases listener setup failed:',error);
+
+}
+
+}
+
 function promptSignIn(text){
 
 $('home').style.display='none';
@@ -1507,6 +1574,8 @@ await loadAdminSecrets();
 
 listenPosts();
 
+listenPurchases();
+
 const pending=readPending();
 
 if(pending&&pending.uid===user.uid&&!paidPosts.has(pending.postId)){
@@ -1685,6 +1754,8 @@ $('logout').onclick=async()=>{
 
 paymentPolling=false;
 activePollOrder=null;
+
+stopPurchasesListener();
 
 await signOut(auth);
 
@@ -2024,6 +2095,8 @@ DELETE BETSLIP
 
 if(paidPosts.has(item.id)){
 
+const paidText=paidContentFor(item.id,post);
+
 return `
 
 <article class="post-card unlocked" data-post-id="${item.id}">
@@ -2055,7 +2128,7 @@ ${countdown}
 
 </div>
 
-<div class="content-text">${esc(post.content||'')}</div>
+<div class="content-text">${esc(paidText||'Your payment was received. The betslip content is being delivered — tap REFRESH in a moment.')}</div>
 
 </div>
 
@@ -2409,7 +2482,7 @@ $('paymentStatus').style.display='none';
 $('paymentForm').style.display='block';
 $('payButton').disabled=false;
 
-alert('We will keep checking. If you completed the payment, your betslip will unlock automatically under My Betslip.');
+alert('We will keep checking. If you completed the payment, your betslip will unlock automatically in Betslips and My Betslip.');
 
 };
 
@@ -2649,7 +2722,7 @@ $('payButton').disabled=false;
 
 renderPostsUI(latestSnapshot);
 
-switchTab('mybetslip');
+switchTab('betslips');
 
 },900);
 
@@ -2731,6 +2804,8 @@ icon.classList.add('fa-spin');
 await loadPurchases();
 
 listenPosts();
+
+listenPurchases();
 
 setTimeout(()=>{
 icon.classList.remove('fa-spin');
