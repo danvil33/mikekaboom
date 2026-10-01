@@ -858,7 +858,7 @@ import{initializeApp}from'https://www.gstatic.com/firebasejs/12.1.0/firebase-app
 
 import{getAuth,onAuthStateChanged,createUserWithEmailAndPassword,signInWithEmailAndPassword,sendPasswordResetEmail,sendEmailVerification,signOut,updateProfile}from'https://www.gstatic.com/firebasejs/12.1.0/firebase-auth.js';
 
-import{getFirestore,doc,setDoc,getDoc,collection,writeBatch,getDocs,deleteDoc,onSnapshot,query,orderBy,limit,serverTimestamp}from'https://www.gstatic.com/firebasejs/12.1.0/firebase-firestore.js';
+import{getFirestore,doc,setDoc,getDoc,collection,addDoc,getDocs,deleteDoc,onSnapshot,query,orderBy,limit,serverTimestamp}from'https://www.gstatic.com/firebasejs/12.1.0/firebase-firestore.js';
 
 const firebaseConfig={
 apiKey:'AIzaSyBEjeRSyKbpEmbNk0SYLUFPp3lbgP9x3Ow',
@@ -895,22 +895,27 @@ let signup=false;
 let currentUser=null;
 let currentIsAdmin=false;
 let stopPosts=null;
-let stopPurchases=null;
+
+// Cache of the last Firestore snapshot for #posts, so the UI can be re-rendered
+// instantly (sign-in, sign-out, refresh, after a purchase) without re-creating the listener.
 let latestSnapshot=null;
+
 let selectedPost=null;
 let selectedPostId=null;
 let paymentPolling=false;
 let paidPosts=new Set();
-let paidData=new Map();
-let adminSecrets=new Map();
 let deleteTargetId=null;
 let pendingUnlock=null;
 let authStatePushed=false;
 let paymentStatePushed=false;
 let activePollOrder=null;
-let rerenderTimer=null;
 
+/* ---------- Pending order persistence ----------
+   The order is remembered on the device the moment the payment request is sent, so
+   closing the tab / app / browser never loses a paid order: on the next visit the
+   site resumes checking it and unlocks the betslip. */
 const PENDING_KEY='mb_pending_order';
+const PENDING_MAX_AGE=24*60*60*1000;
 
 function savePending(order){
 try{localStorage.setItem(PENDING_KEY,JSON.stringify(order));}catch(error){}
@@ -921,7 +926,19 @@ try{localStorage.removeItem(PENDING_KEY);}catch(error){}
 }
 
 function readPending(){
-try{return JSON.parse(localStorage.getItem(PENDING_KEY)||'null');}catch(error){return null;}
+try{
+const order=JSON.parse(localStorage.getItem(PENDING_KEY)||'null');
+if(!order||!order.orderId||!order.postId||!order.uid){
+return null;
+}
+if(order.createdAt&&Date.now()-order.createdAt>PENDING_MAX_AGE){
+clearPending();
+return null;
+}
+return order;
+}catch(error){
+return null;
+}
 }
 
 const $=id=>document.getElementById(id);
@@ -942,58 +959,6 @@ return String(value).replace(/[&<>"']/g,character=>({
 "'":'&#039;',
 '"':'&quot;'
 }[character]));
-}
-
-/* Content the buyer paid for: stored on the purchase record (paid posts keep an empty content field). */
-function paidContentFor(id,post){
-const purchase=paidData.get(id);
-if(purchase&&purchase.content){
-return purchase.content;
-}
-return (post&&post.content)||'';
-}
-
-async function deletePostFully(id){
-await deleteDoc(doc(db,'posts',id));
-try{
-await deleteDoc(doc(db,'postSecrets',id));
-}catch(error){
-console.error('Secret delete failed:',error);
-}
-}
-
-async function loadAdminSecrets(){
-
-adminSecrets=new Map();
-
-if(!currentIsAdmin){
-return;
-}
-
-try{
-
-const snapshot=await getDocs(collection(db,'postSecrets'));
-
-snapshot.forEach(item=>{
-adminSecrets.set(item.id,item.data().content||'');
-});
-
-}catch(error){
-
-console.error('Secrets loading error:',error);
-
-}
-
-}
-
-function queueRerender(){
-if(rerenderTimer){
-return;
-}
-rerenderTimer=setTimeout(()=>{
-rerenderTimer=null;
-renderPostsUI(latestSnapshot);
-},50);
 }
 
 function attachCopyHandlers(scope){
@@ -1141,13 +1106,9 @@ card.remove();
 }
 
 if(currentIsAdmin&&postId){
-deletePostFully(postId).catch(error=>{
+deleteDoc(doc(db,'posts',postId)).catch(error=>{
 console.error('Expired betslip delete failed:',error);
 });
-}
-
-if(!currentIsAdmin){
-queueRerender();
 }
 
 return;
@@ -1223,7 +1184,6 @@ profileSaveBtn.disabled=false;
 async function loadPurchases(){
 
 paidPosts=new Set();
-paidData=new Map();
 
 if(!currentUser){
 return;
@@ -1241,7 +1201,6 @@ const data=item.data();
 
 if(data.status==='COMPLETED'){
 paidPosts.add(item.id);
-paidData.set(item.id,data);
 }
 
 });
@@ -1249,63 +1208,6 @@ paidData.set(item.id,data);
 }catch(error){
 
 console.error('Purchase loading error:',error);
-
-}
-
-}
-
-/* Live listener: as soon as a purchase is marked COMPLETED, the content appears in every tab. */
-function stopPurchasesListener(){
-
-if(stopPurchases){
-try{stopPurchases();}catch(error){}
-stopPurchases=null;
-}
-
-}
-
-function listenPurchases(){
-
-stopPurchasesListener();
-
-if(!currentUser){
-return;
-}
-
-try{
-
-stopPurchases=onSnapshot(
-collection(db,'people',currentUser.uid,'purchases'),
-snapshot=>{
-
-const ids=new Set();
-const data=new Map();
-
-snapshot.forEach(item=>{
-
-const d=item.data();
-
-if(d.status==='COMPLETED'){
-ids.add(item.id);
-data.set(item.id,d);
-}
-
-});
-
-paidPosts=ids;
-paidData=data;
-
-queueRerender();
-
-},
-error=>{
-console.error('Purchases listener error:',error);
-}
-);
-
-}catch(error){
-
-console.error('Purchases listener setup failed:',error);
 
 }
 
@@ -1541,6 +1443,33 @@ msg(error.message);
 
 };
 
+/* Resume checking an order that was paid but never confirmed in this tab
+   (tab closed, app killed, phone locked, connection lost...). */
+function resumePendingOrder(){
+
+const pending=readPending();
+
+if(!pending||!currentUser||pending.uid!==currentUser.uid){
+return;
+}
+
+if(paidPosts.has(pending.postId)){
+clearPending();
+return;
+}
+
+pollPaymentStatus(pending.orderId,pending.postId,pending);
+
+}
+
+document.addEventListener('visibilitychange',()=>{
+
+if(document.visibilityState==='visible'){
+resumePendingOrder();
+}
+
+});
+
 async function openApp(user){
 
 currentUser=user;
@@ -1570,17 +1499,9 @@ switchTab('betslips');
 
 await loadPurchases();
 
-await loadAdminSecrets();
-
 listenPosts();
 
-listenPurchases();
-
-const pending=readPending();
-
-if(pending&&pending.uid===user.uid&&!paidPosts.has(pending.postId)){
-pollPaymentStatus(pending.orderId,pending.postId);
-}
+resumePendingOrder();
 
 if(pendingUnlock&&!currentIsAdmin){
 
@@ -1755,19 +1676,17 @@ $('logout').onclick=async()=>{
 paymentPolling=false;
 activePollOrder=null;
 
-stopPurchasesListener();
-
 await signOut(auth);
 
 currentUser=null;
 currentIsAdmin=false;
 paidPosts=new Set();
-paidData=new Map();
-adminSecrets=new Map();
 
 $('app').style.display='none';
 $('home').style.display='block';
 
+// The realtime posts listener stays connected across sign-out. Just re-render so any
+// admin/paid-only content already in the DOM is hidden right away.
 renderPostsUI(latestSnapshot);
 
 };
@@ -1828,15 +1747,9 @@ throw new Error('Bet start time must be in the future.');
 
 const validityHours=(expiresAt.getTime()-Date.now())/3600000;
 
-const postRef=doc(collection(db,'posts'));
-
-const isPaid=price>0;
-
-const batch=writeBatch(db);
-
-batch.set(postRef,{
+await addDoc(collection(db,'posts'),{
 title,
-content:isPaid?'':content,
+content,
 price,
 platform,
 betStartTime:expiresAt,
@@ -1847,16 +1760,6 @@ authorId:currentUser.uid,
 authorName:currentUser.displayName||currentUser.email,
 createdAt:serverTimestamp()
 });
-
-if(isPaid){
-batch.set(doc(db,'postSecrets',postRef.id),{content});
-}
-
-await batch.commit();
-
-if(isPaid){
-adminSecrets.set(postRef.id,content);
-}
 
 $('postTitle').value='';
 $('postContent').value='';
@@ -1878,6 +1781,7 @@ $('publish').disabled=false;
 
 };
 
+// Subscribes to the "posts" collection once per page session; later calls just re-render from cache.
 function listenPosts(){
 
 if(stopPosts){
@@ -1956,7 +1860,7 @@ const expiredDocs=snapshot.docs.filter(item=>isExpired(item.data()));
 if(currentIsAdmin&&expiredDocs.length){
 
 expiredDocs.forEach(item=>{
-deletePostFully(item.id).catch(error=>{
+deleteDoc(doc(db,'posts',item.id)).catch(error=>{
 console.error('Auto-delete expired betslip failed:',error);
 });
 });
@@ -1966,6 +1870,50 @@ console.error('Auto-delete expired betslip failed:',error);
 const docs=snapshot.docs.filter(item=>item.data().published!==false&&!isExpired(item.data()));
 
 refreshProfileStats();
+
+if(!docs.length){
+
+boxes.forEach(box=>{
+
+box.innerHTML=`
+
+<div class="empty">
+
+<i class="fa-regular fa-folder-open"></i>
+
+<br><br>
+
+No betslips have been published yet.
+
+</div>
+
+`;
+
+});
+
+const myBoxEmpty=$('myBetslipPosts');
+
+if(myBoxEmpty){
+
+myBoxEmpty.innerHTML=`
+
+<div class="empty">
+
+<i class="fa-regular fa-folder-open"></i>
+
+<br><br>
+
+Betslips you pay for will appear here.
+
+</div>
+
+`;
+
+}
+
+return;
+
+}
 
 function countdownMarkup(post){
 
@@ -2078,7 +2026,7 @@ ${countdown}
 
 </div>
 
-<div class="content-text">${esc(adminSecrets.has(item.id)?adminSecrets.get(item.id):(post.content||''))}</div>
+<div class="content-text">${esc(post.content||'')}</div>
 
 </div>
 
@@ -2094,8 +2042,6 @@ DELETE BETSLIP
 }
 
 if(paidPosts.has(item.id)){
-
-const paidText=paidContentFor(item.id,post);
 
 return `
 
@@ -2128,7 +2074,7 @@ ${countdown}
 
 </div>
 
-<div class="content-text">${esc(paidText||'Your payment was received. The betslip content is being delivered — tap REFRESH in a moment.')}</div>
+<div class="content-text">${esc(post.content||'')}</div>
 
 </div>
 
@@ -2185,30 +2131,16 @@ Instant access · Secure payment
 
 }
 
-const liveIds=new Set(docs.map(item=>item.id));
+const html=docs.map(renderCard).join('');
 
-const myLive=docs.filter(item=>Number(item.data().price||0)>0&&paidPosts.has(item.id));
-
-const expiredMine=[...paidData.entries()]
-.filter(([id,data])=>!liveIds.has(id)&&data.content)
-.map(([id,data])=>({
-id:id,
-data:()=>({
-title:data.title,
-content:data.content,
-price:data.amount||1,
-platform:data.platform
-})
-}));
-
-const myItems=[...myLive,...expiredMine];
+const myDocs=docs.filter(item=>Number(item.data().price||0)>0&&paidPosts.has(item.id));
 
 const myBox=$('myBetslipPosts');
 
 if(myBox){
 
-myBox.innerHTML=myItems.length
-?myItems.map(renderCard).join('')
+myBox.innerHTML=myDocs.length
+?myDocs.map(renderCard).join('')
 :`
 
 <div class="empty">
@@ -2228,32 +2160,6 @@ attachCopyHandlers(myBox);
 tickCountdowns();
 
 }
-
-if(!docs.length){
-
-boxes.forEach(box=>{
-
-box.innerHTML=`
-
-<div class="empty">
-
-<i class="fa-regular fa-folder-open"></i>
-
-<br><br>
-
-No betslips have been published yet.
-
-</div>
-
-`;
-
-});
-
-return;
-
-}
-
-const html=docs.map(renderCard).join('');
 
 boxes.forEach(box=>{
 
@@ -2336,9 +2242,7 @@ button.innerHTML='<i class="fa-solid fa-spinner fa-spin"></i> DELETING...';
 
 try{
 
-await deletePostFully(id);
-
-adminSecrets.delete(id);
+await deleteDoc(doc(db,'posts',id));
 
 deleteTargetId=null;
 
@@ -2467,6 +2371,8 @@ history.back();
 
 };
 
+// Closing the waiting screen does NOT cancel the payment: the order keeps being checked
+// in the background and the betslip unlocks automatically when it is confirmed.
 $('cancelPolling').onclick=()=>{
 
 paymentPolling=false;
@@ -2482,7 +2388,7 @@ $('paymentStatus').style.display='none';
 $('paymentForm').style.display='block';
 $('payButton').disabled=false;
 
-alert('We will keep checking. If you completed the payment, your betslip will unlock automatically in Betslips and My Betslip.');
+alert('We will keep checking. If you completed the payment, your betslip will unlock automatically.');
 
 };
 
@@ -2564,19 +2470,16 @@ $('paymentMsg').textContent='Sending payment request...';
 
 try{
 
-const idToken=await currentUser.getIdToken();
-
 const response=await fetch('/api/pay',{
 method:'POST',
-headers:{
-'Content-Type':'application/json',
-'Authorization':'Bearer '+idToken
-},
+headers:{'Content-Type':'application/json'},
 body:JSON.stringify({
 name,
 email,
 phone,
-postId:selectedPostId
+amount,
+postId:selectedPostId,
+userId:currentUser.uid
 })
 });
 
@@ -2584,7 +2487,7 @@ let result;
 
 try{
 result=await response.json();
-}catch(parseError){
+}catch{
 throw new Error('Invalid response from payment server.');
 }
 
@@ -2608,13 +2511,19 @@ $('statusText').textContent='Waiting for payment confirmation...';
 
 paymentPolling=true;
 
-savePending({
+const order={
 orderId:orderId,
 postId:selectedPostId,
-uid:currentUser.uid
-});
+uid:currentUser.uid,
+title:selectedPost.title||'',
+amount:amount,
+createdAt:Date.now()
+};
 
-pollPaymentStatus(orderId,selectedPostId);
+// Remember the order BEFORE we start waiting, so it survives a closed tab.
+savePending(order);
+
+pollPaymentStatus(orderId,selectedPostId,order);
 
 }catch(error){
 
@@ -2642,13 +2551,56 @@ return reason?String(reason).trim():'';
 
 }
 
-async function pollPaymentStatus(orderId,postId){
+// Writes the confirmed purchase to the user's account so it unlocks on every visit/device.
+async function recordPurchase(order){
+
+paidPosts.add(order.postId);
+
+if(!currentUser||currentUser.uid!==order.uid){
+return;
+}
+
+for(let attempt=0;attempt<3;attempt++){
+
+try{
+
+await setDoc(
+doc(db,'people',order.uid,'purchases',order.postId),
+{
+postId:order.postId,
+orderId:order.orderId,
+title:order.title||'',
+amount:Number(order.amount||0),
+status:'COMPLETED',
+paidAt:serverTimestamp()
+}
+);
+
+return;
+
+}catch(saveError){
+
+console.error('Purchase save error (attempt '+(attempt+1)+'):',saveError);
+
+await sleep(800*(attempt+1));
+
+}
+
+}
+
+}
+
+const FAILURE_STATUSES=['FAILED','CANCELLED','CANCELED','REJECTED','DECLINED','ERROR','EXPIRED','TIMEOUT','INSUFFICIENT_FUNDS'];
+
+async function pollPaymentStatus(orderId,postId,order){
 
 if(activePollOrder===orderId){
 return;
 }
 
 activePollOrder=orderId;
+
+const info=order||{orderId:orderId,postId:postId,uid:currentUser?currentUser.uid:'',title:'',amount:0};
 
 let delay=1000;
 const maxDelay=5000;
@@ -2672,33 +2624,22 @@ if(!response.ok){
 throw new Error(result.message||'Unable to check payment.');
 }
 
-const status=result.payment_status;
+const status=String(
+result.payment_status||
+result.data?.[0]?.payment_status||
+result.data?.data?.[0]?.payment_status||
+result.data?.data?.payment_status||
+''
+).toUpperCase();
 
 if(status==='COMPLETED'){
 
 activePollOrder=null;
 paymentPolling=false;
 
+await recordPurchase(info);
+
 clearPending();
-
-await loadPurchases();
-
-if(!paidPosts.has(postId)){
-
-if(uiOpen()){
-
-$('paymentStatus').style.display='none';
-$('paymentForm').style.display='block';
-$('payButton').disabled=false;
-$('paymentMsg').textContent='Payment received (order '+orderId+') but the unlock is delayed. Please contact support with this order number.';
-
-}
-
-renderPostsUI(latestSnapshot);
-
-return;
-
-}
 
 if(uiOpen()){
 
@@ -2720,14 +2661,13 @@ $('successBox').style.display='none';
 $('paymentForm').style.display='block';
 $('payButton').disabled=false;
 
-renderPostsUI(latestSnapshot);
-
-switchTab('betslips');
+unlockCard(postId,selectedPost);
 
 },900);
 
 }else{
 
+// Tab was reopened or the payment window was closed: just refresh the cards.
 renderPostsUI(latestSnapshot);
 
 }
@@ -2736,7 +2676,7 @@ return;
 
 }
 
-if(status==='FAILED'){
+if(FAILURE_STATUSES.includes(status)){
 
 activePollOrder=null;
 paymentPolling=false;
@@ -2779,6 +2719,8 @@ delay=Math.min(delay*1.35,maxDelay);
 
 if(activePollOrder===orderId){
 
+// Still unconfirmed after the wait. The order stays saved on this device, so it is
+// checked again the next time the site is opened.
 activePollOrder=null;
 paymentPolling=false;
 
@@ -2795,6 +2737,82 @@ $('paymentMsg').textContent='Payment not confirmed yet. If you paid, your betsli
 
 }
 
+function unlockCard(postId,post){
+
+const cards=document.querySelectorAll('[data-post-id="'+CSS.escape(postId)+'"]');
+
+if(!cards.length){
+renderPostsUI(latestSnapshot);
+return;
+}
+
+cards.forEach(card=>{
+
+card.classList.add('unlocked');
+
+const locked=card.querySelector('.locked-area');
+
+if(locked){
+
+locked.outerHTML=`
+
+<div class="unlocked-content">
+
+<div class="unlocked-header">
+
+<span><i class="fa-solid fa-circle-check"></i> PAYMENT COMPLETED — BETSLIP UNLOCKED</span>
+
+<button class="copy-btn" type="button" title="Copy content">
+<i class="fa-regular fa-copy"></i>
+</button>
+
+</div>
+
+<div class="content-text">
+
+${esc((post&&post.content)||'')}
+
+</div>
+
+</div>
+
+`;
+
+}
+
+const button=card.querySelector('.pay-button');
+
+if(button){
+button.remove();
+}
+
+const price=card.querySelector('.price');
+
+if(price){
+price.remove();
+}
+
+const badge=card.querySelector('.badge');
+
+if(badge){
+badge.className='badge free';
+badge.innerHTML='<i class="fa-solid fa-circle-check"></i> UNLOCKED';
+}
+
+const icon=card.querySelector('.category-icon');
+
+if(icon){
+icon.innerHTML='<i class="fa-solid fa-lock-open"></i>';
+}
+
+attachCopyHandlers(card);
+
+});
+
+renderPostsUI(latestSnapshot);
+
+}
+
 $('refreshPosts').onclick=async()=>{
 
 const icon=$('refreshPosts').querySelector('i');
@@ -2805,7 +2823,7 @@ await loadPurchases();
 
 listenPosts();
 
-listenPurchases();
+resumePendingOrder();
 
 setTimeout(()=>{
 icon.classList.remove('fa-spin');
