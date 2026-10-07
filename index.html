@@ -602,10 +602,6 @@ REFRESH
 
 <div class="profile-stats">
 <div class="stat-box">
-<span id="profileUnlockedCount">0</span>
-<small>Betslips Unlocked</small>
-</div>
-<div class="stat-box">
 <span id="profileMemberSince">—</span>
 <small>Member Since</small>
 </div>
@@ -943,8 +939,6 @@ return String(value).replace(/[&<>"']/g,character=>({
 }[character]));
 }
 
-/* The paid content lives on the buyer's purchase record (the post itself keeps it empty),
-   so every unlocked card — in Betslips and in My Betslip — reads it from there. */
 const paidSecrets=new Map();
 
 function paidContentFor(id,post){
@@ -959,8 +953,6 @@ return paidSecrets.get(id);
 return (post&&post.content)||'';
 }
 
-/* Paid betslips that were saved before the backend fix have no text on the purchase record.
-   Asking /api/order-status once makes the server fill it in; then we reload the purchases. */
 const repairedOrders=new Set();
 
 async function fillMissingPaidContent(){
@@ -1772,16 +1764,6 @@ requestAnimationFrame(tick);
 
 }
 
-function refreshProfileStats(){
-
-const unlockedCount=$('profileUnlockedCount');
-
-if(unlockedCount){
-unlockedCount.textContent=paidPosts.size;
-}
-
-}
-
 $('logout').onclick=async()=>{
 
 paymentPolling=false;
@@ -1995,8 +1977,6 @@ console.error('Auto-delete expired betslip failed:',error);
 }
 
 const docs=snapshot.docs.filter(item=>item.data().published!==false&&!isExpired(item.data()));
-
-refreshProfileStats();
 
 function countdownMarkup(post){
 
@@ -2214,23 +2194,7 @@ Instant access · Secure payment
 
 }
 
-const liveIds=new Set(docs.map(item=>item.id));
-
-const myLive=docs.filter(item=>Number(item.data().price||0)>0&&paidPosts.has(item.id));
-
-const expiredMine=[...paidData.entries()]
-.filter(([id,data])=>!liveIds.has(id)&&data.content)
-.map(([id,data])=>({
-id:id,
-data:()=>({
-title:data.title,
-content:data.content,
-price:data.amount||1,
-platform:data.platform
-})
-}));
-
-const myItems=[...myLive,...expiredMine];
+const myItems=docs.filter(item=>Number(item.data().price||0)>0&&paidPosts.has(item.id));
 
 const myBox=$('myBetslipPosts');
 
