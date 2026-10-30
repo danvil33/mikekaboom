@@ -653,7 +653,7 @@ REFRESH
 <h2 id="paymentTitle">Unlock Betslip</h2>
 
 <p class="modal-description">
-Complete the payment below. After your payment is confirmed, the betslip will automatically unlock.
+Complete the payment below. After your payment is confirmed, the betslip will automatically unlock. Payments are processed by SplashPay.
 </p>
 
 <div class="payment-price" id="paymentPrice"></div>
@@ -987,9 +987,11 @@ repairedOrders.add(orderId);
 
 try{
 
+const repairToken=await currentUser.getIdToken();
+
 await fetch('/api/order-status',{
 method:'POST',
-headers:{'Content-Type':'application/json'},
+headers:{'Content-Type':'application/json','Authorization':'Bearer '+repairToken},
 body:JSON.stringify({order_id:orderId})
 });
 
@@ -2185,7 +2187,7 @@ UNLOCK FOR ${price.toLocaleString('en-US')} TSH
 
 <div class="trust-line">
 <i class="fa-solid fa-shield-halved"></i>
-Instant access · Secure payment
+Instant access · Secure mobile money payment via SplashPay
 </div>
 
 </article>
@@ -2623,15 +2625,17 @@ $('payButton').disabled=false;
 
 function paymentFailureReason(result){
 
-const reason=
-result?.message||
-result?.data?.[0]?.message||
-result?.data?.data?.[0]?.message||
-result?.data?.data?.message||
-result?.reason||
-'';
+const detail=result?.detail_status;
 
-return reason?String(reason).trim():'';
+if(detail==='cancelled'){
+return 'The payment was cancelled. You have not been charged.';
+}
+
+if(detail==='expired'){
+return 'The payment request expired. Please try again.';
+}
+
+return 'The payment failed or was declined. Please check your PIN and balance and try again.';
 
 }
 
@@ -2643,8 +2647,8 @@ return;
 
 activePollOrder=orderId;
 
-let delay=1000;
-const maxDelay=5000;
+let delay=3000;
+const maxDelay=8000;
 const deadline=Date.now()+15*60*1000;
 
 const uiOpen=()=>$('paymentModal').style.display==='flex'&&selectedPostId===postId;
@@ -2653,13 +2657,28 @@ while(activePollOrder===orderId&&Date.now()<deadline){
 
 try{
 
+const pollToken=await currentUser.getIdToken();
+
 const response=await fetch('/api/order-status',{
 method:'POST',
-headers:{'Content-Type':'application/json'},
+headers:{'Content-Type':'application/json','Authorization':'Bearer '+pollToken},
 body:JSON.stringify({order_id:orderId})
 });
 
 const result=await response.json();
+
+if(response.status===404){
+activePollOrder=null;
+paymentPolling=false;
+clearPending();
+if(uiOpen()){
+$('paymentStatus').style.display='none';
+$('paymentForm').style.display='block';
+$('payButton').disabled=false;
+$('paymentMsg').textContent='This payment could not be found. Please try again.';
+}
+return;
+}
 
 if(!response.ok){
 throw new Error(result.message||'Unable to check payment.');
