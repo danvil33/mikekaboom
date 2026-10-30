@@ -1,385 +1,204 @@
 import { adminDb, adminAuth, FieldValue } from "../lib/admin.js";
+import {
+  initiateMobileMoney,
+  normalizeTanzaniaPhone,
+  newReference,
+  SplashPayConfigError
+} from "../lib/splashpay.js";
+import { settleOrder } from "../lib/orders.js";
 
-/*
- * ===========================================================
- * STATIC DATA — hoisted to module scope.
- * Defined once at module load (cold start) instead of once
- * per request.
- * ===========================================================
- */
-
-const MPESA_PREFIXES = new Set([
-  "740", "741", "742", "743", "744", "745", "746", "747", "748", "749",
-  "750", "751", "752", "753", "754", "755", "756", "757", "758", "759",
-  "760", "761", "762", "763", "764", "765", "766", "767", "768", "769",
-  "770", "771", "772", "773", "774", "775", "776", "777", "778", "779"
-]);
-
-const AIRTEL_PREFIXES = new Set([
-  "680", "681", "682", "683", "684", "685", "686", "687", "688", "689",
-  "690", "691", "692", "693", "694", "695", "696", "697", "698", "699"
-]);
-
-const HALOTEL_PREFIXES = new Set([
-  "620", "621", "622", "623", "624", "625", "626", "627", "628", "629"
-]);
-
-const MIXX_PREFIXES = new Set([
-  "650", "651", "652", "653", "654", "655", "656", "657", "658", "659",
-  "660", "661", "662", "663", "664", "665", "666", "667", "668", "669",
-  "670", "671", "672", "673", "674", "675", "676", "677", "678", "679"
-]);
-
-const TTCL_PREFIXES = new Set([
-  "710", "711", "712", "713", "714", "715", "716", "717", "718", "719"
-]);
-
-/*
- * How long we'll wait on PalmPesa before giving up and returning
- * a clean error to the frontend.
- */
-const PALMPESA_TIMEOUT_MS = 25000;
-
-/*
- * NORMALIZE TANZANIAN PHONE NUMBER
- *
- * Accepted:
- *
- * 0712345678
- * 0612345678
- * +255712345678
- * 255712345678
- */
-function normalizeTanzaniaPhone(value) {
-
-  let p = String(value)
-    .trim()
-    .replace(/\s+/g, "")
-    .replace(/-/g, "");
-
-  if (p.startsWith("+255")) {
-    p = p.substring(1);
-  }
-
-  if (p.startsWith("0")) {
-    p = "255" + p.substring(1);
-  }
-
-  return p;
-}
-
-/*
- * DETECT NETWORK FROM PREFIX
- *
- * Mainly for logging/debugging — not relied on for PalmPesa
- * routing unless their API explicitly supports it.
- */
-function detectNetwork(prefix) {
-
-  if (MPESA_PREFIXES.has(prefix)) {
-    return "MPESA";
-  }
-
-  if (AIRTEL_PREFIXES.has(prefix)) {
-    return "AIRTEL";
-  }
-
-  if (HALOTEL_PREFIXES.has(prefix)) {
-    return "HALOPESA";
-  }
-
-  if (MIXX_PREFIXES.has(prefix)) {
-    return "MIXX";
-  }
-
-  if (TTCL_PREFIXES.has(prefix)) {
-    return "TTCL";
-  }
-
-  return "UNKNOWN";
-}
-
-/*
- * FETCH WITH TIMEOUT
- *
- * Wraps fetch with an AbortController so a slow or hung
- * PalmPesa endpoint fails fast with a clear error.
- */
-async function fetchWithTimeout(url, options, timeoutMs) {
-
-  const controller = new AbortController();
-
-  const timer = setTimeout(
-    () => controller.abort(),
-    timeoutMs
-  );
-
-  try {
-
-    return await fetch(url, {
-      ...options,
-      signal: controller.signal
-    });
-
-  } finally {
-
-    clearTimeout(timer);
-
-  }
-
-}
+const REUSE_PENDING_MS =
+  (Number(process.env.PENDING_REUSE_MINUTES) || 10) * 60 * 1000;
 
 export default async function handler(req, res) {
 
-  /*
-   * ONLY POST
-   */
   if (req.method !== "POST") {
-    return res.status(405).json({
-      success: false,
-      message: "Method not allowed"
-    });
+    return res.status(405).json({ success: false, message: "Method not allowed" });
   }
 
   try {
 
-    /*
-     * WHO IS PAYING? Verify the Firebase login token.
-     */
-    const idToken =
-      (req.headers.authorization || "").replace("Bearer ", "");
-
+    // WHO IS PAYING — verified Firebase token
+    const idToken = (req.headers.authorization || "").replace("Bearer ", "");
     let uid;
-
     try {
       uid = (await adminAuth.verifyIdToken(idToken)).uid;
     } catch {
-      return res.status(401).json({
-        success: false,
-        message: "Please sign in again."
-      });
+      return res.status(401).json({ success: false, message: "Please sign in again." });
     }
 
-    /*
-     * FRONTEND DATA
-     * (amount is no longer taken from the browser)
-     */
     const { name, email, phone, postId } = req.body || {};
 
-    if (!name || !email || !phone || !postId) {
-      return res.status(400).json({
-        success: false,
-        message: "All fields are required"
-      });
+    if (!name || !email || !phone || !postId || typeof postId !== "string" || postId.includes("/")) {
+      return res.status(400).json({ success: false, message: "All fields are required" });
     }
 
-    /*
-     * PRICE COMES FROM THE DATABASE, NEVER FROM THE BROWSER
-     */
+    // PRICE FROM DATABASE ONLY
     const postSnap = await adminDb.doc(`posts/${postId}`).get();
-
     if (!postSnap.exists) {
-      return res.status(404).json({
-        success: false,
-        message: "Betslip not found or expired."
-      });
+      return res.status(404).json({ success: false, message: "Betslip not found or expired." });
+    }
+    const post = postSnap.data();
+
+    const expiresMs = post.expiresAt?.toMillis ? post.expiresAt.toMillis() : null;
+    if (expiresMs && expiresMs <= Date.now()) {
+      return res.status(404).json({ success: false, message: "Betslip not found or expired." });
     }
 
-    const amount = Number(postSnap.data().price);
-
+    const amount = Number(post.price);
     if (!Number.isFinite(amount) || amount <= 0) {
+      return res.status(400).json({ success: false, message: "Invalid betslip price." });
+    }
+
+    const phoneIntl = normalizeTanzaniaPhone(phone);
+    if (!phoneIntl) {
       return res.status(400).json({
         success: false,
-        message: "Invalid betslip price."
+        message: "Invalid Tanzania phone number. Use 07XXXXXXXX, 06XXXXXXXX or +255XXXXXXXXX."
       });
     }
 
-    const normalizedPhone = normalizeTanzaniaPhone(phone);
-
-    /*
-     * VALIDATE TANZANIA NUMBER
-     *
-     * Tanzania mobile numbers normally become:
-     * 255XXXXXXXXX
-     */
-    if (!/^255\d{9}$/.test(normalizedPhone)) {
-      return res.status(400).json({
+    // ALREADY PURCHASED — never charge twice
+    const purchased = await adminDb.doc(`people/${uid}/purchases/${postId}`).get();
+    if (purchased.exists && purchased.data().status === "COMPLETED") {
+      return res.status(409).json({
         success: false,
-        message:
-          "Invalid Tanzania phone number. Use 07XXXXXXXX, 06XXXXXXXX or +255XXXXXXXXX."
+        message: "You already own this betslip. Open My Betslip to view it."
       });
     }
 
-    /*
-     * GET THE PREFIX
-     *
-     * Example: 255712345678
-     *               ^^^
-     */
-    const prefix = normalizedPhone.substring(3, 6);
+    // RECENT PENDING ORDER FOR THE SAME USER + BETSLIP — reuse instead of charging again
+    const pendingSnap = await adminDb
+      .collection("orders")
+      .where("uid", "==", uid)
+      .where("postId", "==", postId)
+      .where("status", "==", "PENDING")
+      .get();
 
-    const network = detectNetwork(prefix);
+    for (const d of pendingSnap.docs) {
+      const o = d.data();
+      if (o.provider === "splashpay" && Date.now() - (o.createdAtMs || 0) < REUSE_PENDING_MS) {
+        try {
+          const r = await settleOrder(d.id);
+          if (r.payment_status === "COMPLETED") {
+            return res.status(409).json({
+              success: false,
+              message: "Your payment was already received. Open My Betslip to view it."
+            });
+          }
+          if (r.payment_status === "PENDING") {
+            return res.json({
+              success: true,
+              reused: true,
+              order_id: d.id,
+              reference: d.id,
+              message: "A payment for this betslip is already waiting for your PIN."
+            });
+          }
+          // FAILED -> fall through and create a new order
+        } catch {
+          // Can't verify the old order right now: safest is to keep waiting on it
+          return res.json({
+            success: true, reused: true, order_id: d.id, reference: d.id,
+            message: "A payment for this betslip is already waiting for your PIN."
+          });
+        }
+      }
+    }
 
-    /*
-     * UNIQUE TRANSACTION ID
-     */
-    const transactionId =
-      "TXN-" +
-      Date.now() +
-      "-" +
-      Math.floor(Math.random() * 10000);
+    // CREATE THE ORDER FIRST (so a fast webhook always finds it)
+    const reference = newReference();
 
-    /*
-     * PAYMENT DATA
-     */
-    const paymentData = {
-      name: name,
-      email: email,
-      phone: normalizedPhone,
-      amount: amount,
-      transaction_id: transactionId,
-      address: "Geita",
-      postcode: "30100",
-      network: network
-    };
-
-    console.log("PalmPesa payment request:", {
+    await adminDb.doc(`orders/${reference}`).set({
       uid,
       postId,
-      normalizedPhone,
-      prefix,
-      network,
       amount,
-      transactionId
+      currency: "TZS",
+      phone: phoneIntl,
+      provider: "splashpay",
+      status: "PENDING",
+      createdAt: FieldValue.serverTimestamp(),
+      createdAtMs: Date.now()
     });
 
-    /*
-     * SEND TO PALMPESA — bounded by PALMPESA_TIMEOUT_MS
-     */
-    let response;
-
+    // INITIATE WITH SPLASHPAY (from the backend)
+    let result;
     try {
-
-      response = await fetchWithTimeout(
-        "https://palmpesa.drmlelwa.co.tz/api/pay-via-mobile",
-        {
-          method: "POST",
-          headers: {
-            "Authorization": `Bearer ${process.env.PALMPESA_TOKEN}`,
-            "Content-Type": "application/json",
-            "Accept": "application/json"
-          },
-          body: JSON.stringify(paymentData)
-        },
-        PALMPESA_TIMEOUT_MS
-      );
-
-    } catch (fetchError) {
-
-      const timedOut = fetchError.name === "AbortError";
-
-      console.error(
-        "PalmPesa request failed:",
-        timedOut ? "timed out" : fetchError.message
-      );
-
-      return res.status(504).json({
-        success: false,
-        message: timedOut
-          ? "PalmPesa is slow to respond. If a PIN prompt appears on your phone, complete it before trying again to avoid paying twice."
-          : "Unable to reach PalmPesa. Please try again.",
-        transaction_id: transactionId
-      });
-
-    }
-
-    /*
-     * READ RAW RESPONSE
-     */
-    const rawResponse = await response.text();
-
-    /*
-     * PARSE JSON
-     */
-    let data;
-
-    try {
-      data = JSON.parse(rawResponse);
-    } catch {
-      data = { raw_response: rawResponse };
-    }
-
-    /*
-     * TRY TO FIND ORDER ID
-     */
-    const orderId =
-      data?.order_id ||
-      data?.data?.order_id ||
-      data?.data?.data?.order_id ||
-      data?.order?.order_id ||
-      null;
-
-    console.log("PalmPesa response:", {
-      httpStatus: response.status,
-      orderId,
-      raw: rawResponse
-    });
-
-    /*
-     * SAVE THE ORDER ON THE SERVER so any later status check
-     * can unlock the right user's betslip.
-     */
-    if (orderId) {
-
-      await adminDb.doc(`orders/${orderId}`).set({
-        uid,
-        postId,
+      result = await initiateMobileMoney({
         amount,
-        phone: normalizedPhone,
-        transactionId,
-        status: "PENDING",
-        createdAt: FieldValue.serverTimestamp()
+        reference,
+        phone: phoneIntl,
+        customerName: String(name).trim(),
+        customerEmail: String(email).trim()
       });
+    } catch (err) {
 
-    } else {
+      if (err instanceof SplashPayConfigError) {
+        console.error("SplashPay not configured");
+        await adminDb.doc(`orders/${reference}`).update({ status: "FAILED", failureStatus: "failed" });
+        return res.status(503).json({
+          success: false,
+          message: "Payments are temporarily unavailable. Please try again later."
+        });
+      }
 
-      console.error(
-        "NO ORDER ID from PalmPesa. Raw:",
-        rawResponse,
-        "uid:",
-        uid,
-        "postId:",
-        postId
-      );
-
+      // Timeout / network error: outcome unknown. Keep the order PENDING; the
+      // webhook or status check will resolve it (or it fails after a grace period).
+      const timedOut = err.name === "AbortError";
+      console.error("SplashPay initiate error:", timedOut ? "timeout" : err.message);
+      return res.status(202).json({
+        success: true,
+        unconfirmed: true,
+        order_id: reference,
+        reference,
+        message: "We are waiting for the payment provider. If a PIN prompt appears, enter it."
+      });
     }
 
-    /*
-     * RETURN TO FRONTEND
-     */
-    return res.status(response.status).json({
-      success: response.ok,
-      palmPesaStatus: response.status,
-      transaction_id: transactionId,
-      order_id: orderId,
-      detected_network: network,
-      normalized_phone: normalizedPhone,
-      data: data
+    const body = result.data || {};
+    const accepted =
+      result.ok && body.status === "success" && body.data?.reference === reference;
+
+    if (!accepted) {
+      console.error("SplashPay rejected payment:", reference, result.httpStatus, body.code, body.message);
+      await adminDb.doc(`orders/${reference}`).update({
+        status: "FAILED",
+        failureStatus: "failed",
+        failureCode: body.code || null
+      });
+
+      const userMessage =
+        result.httpStatus === 401 || result.httpStatus === 403
+          ? "Payments are temporarily unavailable. Please try again later."
+          : result.httpStatus === 429
+          ? "Too many attempts. Please wait a moment and try again."
+          : body.code === "INVALID_REQUEST"
+          ? "Payment details were not accepted. Check your phone number and try again."
+          : "Unable to start the payment. Please try again.";
+
+      return res.status(result.ok ? 502 : (result.httpStatus >= 500 ? 502 : 400)).json({
+        success: false,
+        message: userMessage
+      });
+    }
+
+    await adminDb.doc(`orders/${reference}`).update({
+      providerReference: body.data.provider_reference || null,
+      fee: body.data.fee ?? null,
+      requestId: body.request_id || null
+    });
+
+    return res.json({
+      success: true,
+      order_id: reference,
+      reference
     });
 
   } catch (error) {
-
-    /*
-     * SERVER ERROR
-     */
-    console.error("PalmPesa payment server error:", error);
-
+    console.error("Payment server error:", error);
     return res.status(500).json({
       success: false,
-      message: "Server error while contacting PalmPesa",
-      error: error.message
+      message: "Server error while starting the payment."
     });
-
   }
-
 }
