@@ -8,7 +8,7 @@ import {
 import { settleOrder } from "../lib/orders.js";
 
 const REUSE_PENDING_MS =
-  (Number(process.env.PENDING_REUSE_MINUTES) || 10) * 60 * 1000;
+  (Number(process.env.PENDING_REUSE_MINUTES) || 2) * 60 * 1000;
 
 export default async function handler(req, res) {
 
@@ -77,7 +77,11 @@ export default async function handler(req, res) {
 
     for (const d of pendingSnap.docs) {
       const o = d.data();
-      if (o.provider === "splashpay" && Date.now() - (o.createdAtMs || 0) < REUSE_PENDING_MS) {
+      if (
+        o.provider === "splashpay" &&
+        o.phone === phoneIntl &&
+        Date.now() - (o.createdAtMs || 0) < REUSE_PENDING_MS
+      ) {
         try {
           const r = await settleOrder(d.id);
           if (r.payment_status === "COMPLETED") {
