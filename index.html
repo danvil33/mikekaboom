@@ -273,6 +273,14 @@ button:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-vis
 @media(max-width:700px){.topbar{height:calc(62px + env(safe-area-inset-top));padding:env(safe-area-inset-top) 14px 0}.home-nav{padding:14px 18px;flex-wrap:wrap;gap:10px}.home-nav .logo{font-size:19px}.user-name{display:none}.logout{padding:9px 13px;font-size:11px}.tab-btn{font-size:9.5px}.tab-btn i{font-size:17px}.content{width:94vw;padding:calc(62px + env(safe-area-inset-top) + 20px) 0 calc(86px + env(safe-area-inset-bottom))}.profile-card{padding:22px;gap:16px}.profile-avatar{width:58px;height:58px;font-size:19px}.section-header{align-items:flex-start;flex-direction:column;gap:10px}.refresh{align-self:flex-start}.posts{grid-template-columns:1fr;gap:16px}.post-card{min-height:auto;padding:20px}.locked-area{padding:20px}.admin-panel{padding:20px}.modal-box{padding:26px}.intro h1{font-size:44px}}
 @media(max-width:480px){.intro h1{font-size:34px}.intro p{font-size:13.5px;margin-top:10px}.primary-btn,.ghost-btn{width:100%;justify-content:center}.auth-main{padding:26px}.auth-main h1{font-size:29px}.field input,.field textarea{padding:12px 13px}.input-wrap input{padding-left:40px}.field-icon{left:13px}.modal-box{padding:20px;border-radius:8px}.confirm-box{padding:22px}.confirm-actions{flex-direction:column}.payment-icon,.confirm-icon{width:50px;height:50px;font-size:17px;border-radius:8px}.modal-box h2{margin-right:40px;font-size:23px}.price{font-size:19px}.badge{font-size:9px;padding:5px 9px}.section-title h2{font-size:20px}.admin-panel{padding:18px;border-radius:8px}.admin-title h2{font-size:17px}.post-card h3{font-size:18px}.lock-circle{width:46px;height:46px;font-size:16px}}
 @media(max-width:360px){.intro h1{font-size:29px}.content{width:96vw}}
+.unlocking-area{flex:1;margin-top:10px;padding:24px 18px;border-radius:6px;background:var(--gold-tint);border:1.5px dashed var(--gold);display:flex;flex-direction:column;align-items:center;text-align:center;gap:12px}
+.unlocking-area .spinner{margin:0}
+.unlocking-area strong{font-size:14.5px;font-weight:800}
+.unlocking-area p{margin:0;font-size:12.5px;color:var(--ink-soft);line-height:1.5;font-weight:600}
+.unlocking-lines{width:100%;display:flex;flex-direction:column;gap:9px;margin-top:6px}
+.unlocking-lines .sk{height:11px}
+.wait-banner{display:flex;align-items:center;gap:10px;background:var(--gold-tint);border:1.5px dashed var(--gold);border-radius:var(--radius-sm);padding:12px 14px;margin-top:16px;font-size:13px;font-weight:700;line-height:1.45;text-align:left}
+.wait-banner i{color:var(--gold);font-size:16px;flex-shrink:0}
 </style>
 </head>
 
@@ -695,6 +703,8 @@ PAY NOW
 
 <small>Ingiza PIN kwenye simu yako kukamilisha</small>
 
+<div class="wait-banner"><i class="fa-solid fa-hourglass-half"></i><span>Tafadhari subiri, usiondoke kwenye hii screen.</span></div>
+
 <div class="status-text" id="statusText">Checking payment status...</div>
 
 <button class="link" id="cancelPolling" type="button" style="margin-top:16px">
@@ -708,7 +718,7 @@ inasubiri...
 <br><br>
 PAYMENT COMPLETED
 <br><br>
-Unlocking your content...
+Tunafungua betslip yako...<br>Tafadhari subiri, usiondoke kwenye hii screen.
 </div>
 
 <div class="failed-box" id="failedBox">
@@ -904,6 +914,10 @@ let authStatePushed=false;
 let paymentStatePushed=false;
 let activePollOrder=null;
 let rerenderTimer=null;
+let unlockingPostId=null;
+let paidLoading=false;
+let stopPurchases=null;
+let pollWake=null;
 
 const PENDING_KEY='mb_pending_order';
 
@@ -928,6 +942,93 @@ $('msg').textContent=text;
 function sleep(ms){
 return new Promise(resolve=>setTimeout(resolve,ms));
 }
+
+function wakeableSleep(ms){
+return new Promise(resolve=>{
+const t=setTimeout(done,ms);
+function done(){clearTimeout(t);pollWake=null;resolve();}
+pollWake=done;
+});
+}
+
+function unlockingMarkup(){
+return `<div class="unlocking-area">
+<div class="spinner"></div>
+<strong>Tunafungua betslip yako...</strong>
+<p>Tafadhari subiri, usiondoke kwenye hii screen.</p>
+<div class="unlocking-lines"><div class="sk" style="width:90%"></div><div class="sk" style="width:75%"></div><div class="sk" style="width:82%"></div><div class="sk" style="width:55%"></div></div>
+</div>`;
+}
+
+function showUnlockSuccess(postId){
+unlockingPostId=null;
+const open=$('paymentModal').style.display==='flex'&&selectedPostId===postId;
+launchConfetti();
+if(open){
+$('paymentStatus').style.display='none';
+$('failedBox').style.display='none';
+$('successBox').style.display='block';
+setTimeout(()=>{
+$('paymentModal').style.display='none';
+if(paymentStatePushed){paymentStatePushed=false;history.back();}
+$('successBox').style.display='none';
+$('paymentForm').style.display='block';
+$('payButton').disabled=false;
+renderPostsUI(latestSnapshot);
+switchTab('betslips');
+},900);
+}else{
+renderPostsUI(latestSnapshot);
+}
+}
+
+function listenPurchases(){
+if(stopPurchases){stopPurchases();stopPurchases=null;}
+if(!currentUser){return;}
+stopPurchases=onSnapshot(
+collection(db,'people',currentUser.uid,'purchases'),
+snap=>{
+const ids=new Set();
+const data=new Map();
+snap.forEach(item=>{
+const d=item.data();
+if(d.status==='COMPLETED'){ids.add(item.id);data.set(item.id,d);}
+});
+const newlyPaid=[...ids].filter(id=>!paidPosts.has(id));
+paidPosts=ids;
+paidData=data;
+newlyPaid.forEach(id=>{
+if(unlockingPostId===id||(readPending()||{}).postId===id){
+activePollOrder=null;
+paymentPolling=false;
+clearPending();
+showUnlockSuccess(id);
+}
+});
+queueRerender();
+},
+error=>console.warn('Purchases listener error:',error)
+);
+}
+
+function resumeChecks(){
+if(document.visibilityState&&document.visibilityState!=='visible'){return;}
+if(!currentUser){return;}
+if(activePollOrder){
+if(pollWake){pollWake();}
+return;
+}
+const p=readPending();
+if(p&&p.uid===currentUser.uid&&!paidPosts.has(p.postId)){
+unlockingPostId=p.postId;
+queueRerender();
+pollPaymentStatus(p.orderId,p.postId);
+}
+}
+
+document.addEventListener('visibilitychange',resumeChecks);
+window.addEventListener('focus',resumeChecks);
+window.addEventListener('pageshow',resumeChecks);
 
 function esc(value){
 return String(value).replace(/[&<>"']/g,character=>({
@@ -971,6 +1072,9 @@ const missing=[...paidPosts].filter(id=>!hasText(id));
 if(!missing.length){
 return;
 }
+
+paidLoading=true;
+queueRerender();
 
 const toRepair=missing.filter(id=>{
 const orderId=(paidData.get(id)||{}).orderId;
@@ -1032,6 +1136,7 @@ console.error('Purchase reload failed:',error);
 
 }
 
+paidLoading=false;
 queueRerender();
 
 }
@@ -1596,6 +1701,8 @@ switchTab('betslips');
 
 await loadPurchases();
 
+listenPurchases();
+
 fillMissingPaidContent();
 
 await loadAdminSecrets();
@@ -1604,8 +1711,14 @@ listenPosts();
 
 const pending=readPending();
 
-if(pending&&pending.uid===user.uid&&!paidPosts.has(pending.postId)){
+if(pending&&pending.uid===user.uid){
+if(paidPosts.has(pending.postId)){
+clearPending();
+}else{
+unlockingPostId=pending.postId;
+queueRerender();
 pollPaymentStatus(pending.orderId,pending.postId);
+}
 }
 
 if(pendingUnlock&&!currentIsAdmin){
@@ -1770,6 +1883,8 @@ $('logout').onclick=async()=>{
 
 paymentPolling=false;
 activePollOrder=null;
+unlockingPostId=null;
+if(stopPurchases){stopPurchases();stopPurchases=null;}
 
 await signOut(auth);
 
@@ -2106,6 +2221,12 @@ DELETE BETSLIP
 
 }
 
+if(paidPosts.has(item.id)&&paidLoading&&!paidContentFor(item.id,post)){
+
+return `<article class="post-card" data-post-id="${item.id}">${platformLogos}<div class="card-top"><div class="badge free"><i class="fa-solid fa-circle-check"></i>PAID</div>${countdown}</div><h3>${esc(post.title||'Untitled')}</h3>${unlockingMarkup()}</article>`;
+
+}
+
 if(paidPosts.has(item.id)){
 
 return `
@@ -2149,6 +2270,12 @@ ${countdown}
 
 }
 
+if(unlockingPostId===item.id){
+
+return `<article class="post-card" data-post-id="${item.id}">${platformLogos}<div class="card-top"><div class="badge premium"><i class="fa-solid fa-hourglass-half"></i>UNLOCKING</div>${countdown}</div><h3>${esc(post.title||'Untitled')}</h3>${unlockingMarkup()}</article>`;
+
+}
+
 return `
 
 <article class="post-card" data-post-id="${item.id}">
@@ -2187,7 +2314,7 @@ UNLOCK FOR ${price.toLocaleString('en-US')} TSH
 
 <div class="trust-line">
 <i class="fa-solid fa-shield-halved"></i>
-Instant access · Secure mobile money payment via SplashPay
+Instant access · Secure mobile money payment
 </div>
 
 </article>
@@ -2465,6 +2592,7 @@ history.back();
 $('cancelPolling').onclick=()=>{
 
 paymentPolling=false;
+queueRerender();
 
 $('paymentModal').style.display='none';
 
@@ -2609,6 +2737,9 @@ postId:selectedPostId,
 uid:currentUser.uid
 });
 
+unlockingPostId=selectedPostId;
+queueRerender();
+
 pollPaymentStatus(orderId,selectedPostId);
 
 }catch(error){
@@ -2646,6 +2777,8 @@ return;
 }
 
 activePollOrder=orderId;
+unlockingPostId=postId;
+queueRerender();
 
 let delay=3000;
 const maxDelay=8000;
@@ -2662,15 +2795,20 @@ const pollToken=await currentUser.getIdToken();
 const response=await fetch('/api/order-status',{
 method:'POST',
 headers:{'Content-Type':'application/json','Authorization':'Bearer '+pollToken},
-body:JSON.stringify({order_id:orderId})
+body:JSON.stringify({order_id:orderId}),
+signal:AbortSignal.timeout?AbortSignal.timeout(12000):undefined
 });
 
 const result=await response.json();
+
+if(activePollOrder!==orderId){return;}
 
 if(response.status===404){
 activePollOrder=null;
 paymentPolling=false;
 clearPending();
+unlockingPostId=null;
+queueRerender();
 if(uiOpen()){
 $('paymentStatus').style.display='none';
 $('paymentForm').style.display='block';
@@ -2699,6 +2837,8 @@ await fillMissingPaidContent();
 
 if(!paidPosts.has(postId)){
 
+unlockingPostId=null;
+
 if(uiOpen()){
 
 $('paymentStatus').style.display='none';
@@ -2714,37 +2854,7 @@ return;
 
 }
 
-if(uiOpen()){
-
-$('paymentStatus').style.display='none';
-$('successBox').style.display='block';
-
-launchConfetti();
-
-setTimeout(()=>{
-
-$('paymentModal').style.display='none';
-
-if(paymentStatePushed){
-paymentStatePushed=false;
-history.back();
-}
-
-$('successBox').style.display='none';
-$('paymentForm').style.display='block';
-$('payButton').disabled=false;
-
-renderPostsUI(latestSnapshot);
-
-switchTab('betslips');
-
-},900);
-
-}else{
-
-renderPostsUI(latestSnapshot);
-
-}
+showUnlockSuccess(postId);
 
 return;
 
@@ -2756,6 +2866,9 @@ activePollOrder=null;
 paymentPolling=false;
 
 clearPending();
+
+unlockingPostId=null;
+queueRerender();
 
 if(uiOpen()){
 
@@ -2785,7 +2898,7 @@ $('statusText').textContent='Still checking payment...';
 
 }
 
-await sleep(delay);
+await wakeableSleep(delay);
 
 delay=Math.min(delay*1.35,maxDelay);
 
@@ -2795,6 +2908,8 @@ if(activePollOrder===orderId){
 
 activePollOrder=null;
 paymentPolling=false;
+unlockingPostId=null;
+queueRerender();
 
 if(uiOpen()){
 
